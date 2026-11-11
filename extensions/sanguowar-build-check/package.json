@@ -1,0 +1,14 @@
+{
+  "name": "sanguowar-build-check",
+  "version": "1.0.0",
+  "description": "三国战棋：微信小游戏构建产物校验（自动检查 game.json 方向、主包体积、必要文件）",
+  "main": "dist/hooks.js",
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "contributions": {
+    "builder": {
+      "hooks": "./dist/hooks.js"
+    }
+  }
+}

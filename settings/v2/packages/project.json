@@ -1,0 +1,12 @@
+{
+  "__version__": "1.0.6",
+  "general": {
+    "designResolution": {
+      "width": 720,
+      "height": 1280,
+      "fitWidth": false,
+      "fitHeight": true
+    },
+    "startScene": "8f2e4c6a-1b3d-4e5f-9a7c-2d1e0b3c4a5d"
+  }
+}

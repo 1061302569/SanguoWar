@@ -1,0 +1,78 @@
+{
+  "__version__": "1.3.9",
+  "common": {
+    "platform": "wechatgame",
+    "taskName": "wechatgame",
+    "sourceMaps": false
+  },
+  "wechatgame": {
+    "appid": "wx0000000000000000",
+    "useSplashScreen": false
+  },
+  "BuildTaskManager": {
+    "queue": [
+      {
+        "id": "wechatgame",
+        "state": "none",
+        "progress": 0,
+        "options": {
+          "platform": "wechatgame",
+          "taskName": "wechatgame",
+          "name": "三国战棋",
+
+          "startScene": "8f2e4c6a-1b3d-4e5f-9a7c-2d1e0b3c4a5d",
+          "scenes": [
+            {
+              "url": "db://assets/scenes/Main.scene",
+              "uuid": "8f2e4c6a-1b3d-4e5f-9a7c-2d1e0b3c4a5d"
+            }
+          ],
+
+          "buildPath": "build",
+          "debug": false,
+          "sourceMaps": false,
+          "md5Cache": true,
+          "inlineSpriteFrames": false,
+          "packAutoAtlas": true,
+          "compressTexture": true,
+          "mergeStartScene": true,
+
+          "designResolution": {
+            "width": 720,
+            "height": 1280,
+            "fitWidth": false,
+            "fitHeight": true
+          },
+          "designWidth": 720,
+          "designHeight": 1280,
+          "orientation": "portrait",
+
+          "appid": "wx0000000000000000",
+          "useSplashScreen": false,
+          "showSplashSettings": false,
+          "separateEngine": false,
+          "forceCombileEngine": false,
+          "compileEngineOnly": false,
+          "subContext": "",
+          "remoteServerAddress": "",
+
+          "includeModules": [
+            "base",
+            "gfx-webgl",
+            "gfx-webgl2",
+            "2d",
+            "ui",
+            "graphics",
+            "mask",
+            "rich-text",
+            "tween",
+            "intersection-2d",
+            "affine-transform",
+            "custom-pipeline",
+            "profiler"
+          ]
+        }
+      }
+    ]
+  }
+}
