@@ -68,18 +68,20 @@ function playOne(seed: number): Run {
             }
         }
 
-        // 有优势就打
-        const movable: Array<{ from: any; to: any; ratio: number }> = [];
+        // 按游戏里真实显示的「胜算」决策，而不是裸兵力比 + 绝对兵数门槛。
+        // 旧策略要求「至少 400 兵且裸比 > 1.3」，残局走廊城被反复消耗到 340 兵时
+        // 明明 previewAttack 报 0.7~0.9 胜算却一枪不放，硬卡 24 回合、金币堆 7.9 万 ——
+        // 那是测试里的假玩家在犯傻，不是游戏打不动。真实玩家看面板就会点进攻。
+        const movable: Array<{ from: any; to: any; win: number }> = [];
         for (const p of gs.provincesOf(fid)) {
             for (const tg of gs.attackTargets(p)) {
-                const ratio = p.troops / Math.max(1, tg.troops * (1 + tg.fort * 0.08));
-                if (ratio > 1.3) movable.push({ from: p, to: tg, ratio });
+                const pv = gs.previewAttack(p, tg);
+                if (pv.winRate >= 0.5) movable.push({ from: p, to: tg, win: pv.winRate });
             }
         }
-        movable.sort((a, b) => b.ratio - a.ratio);
+        movable.sort((a, b) => b.win - a.win);
         let fought = 0;
         for (const m of movable) {
-            if (m.from.troops < 400) continue;
             if (gs.attack(m.from, m.to)) fought++;
         }
         // 有目标却一次都打不出去 = 僵持回合
@@ -113,6 +115,8 @@ section('1. 每一局都必须能打完（不能卡在最后几座城）');
 // ----------------------------------------------------------------------
 const SEEDS = [12345, 777, 2024, 555, 999, 31337];
 const runs = SEEDS.map(playOne);
+runs.forEach((r, i) => console.log(
+    `  · seed ${SEEDS[i]}: ${r.turns} 回合 / ${r.cities} 城 / 金币 ${r.gold} / 僵持 ${r.stalled}`));
 const wins = runs.filter((r) => r.win).length;
 check(wins === SEEDS.length,
     `${SEEDS.length} 局全部通关（${wins}/${SEEDS.length}；卡住的局说明兵凑不出单点优势）`);

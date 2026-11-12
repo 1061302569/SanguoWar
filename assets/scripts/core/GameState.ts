@@ -1113,6 +1113,22 @@ export class GameState {
     }
 
     /**
+     * 战力比 → 胜率，**全游戏唯一入口**
+     *
+     * 玩家面板的「胜算」与 AI 的出兵决策必须走同一条曲线：以前面板算的是
+     * 「兵力 × 将领 × 工事」的胜率，AI 却拿裸兵力比 1.15 硬判，两边看到的
+     * 根本不是同一场仗 —— AI 会在玩家看着「慎攻」时反复来撞，也会在名将
+     * 在手、明明能打时一动不动。
+     */
+    public winRateOf(ratio: number): number {
+        // 守城本就有优势：战力比 1.15 才算五五开
+        const x = Math.max(0.001, ratio / Balance.aiAttackRatio);
+        const k = 1.5;
+        const v = Math.pow(x, k);
+        return v / (v + 1);
+    }
+
+    /**
      * 战前胜算预估（纯计算，不掷随机、不改任何状态）
      *
      * 面板在玩家点「进攻」之前给出一个档位提示：兵力、守将、工事、君主加成
@@ -1131,10 +1147,7 @@ export class GameState {
         const atkPower = Math.max(1, atkSide.troops) * atkMul;
         const defPower = Math.max(1, defSide.troops) * defMul;
         const ratio = atkPower / defPower;
-        // 守城本就有优势：战力比 1.15 才算五五开（与 aiAttackRatio 同口径）
-        const x = ratio / Balance.aiAttackRatio;
-        const k = 1.5;
-        const winRate = Math.pow(x, k) / (Math.pow(x, k) + 1);
+        const winRate = this.winRateOf(ratio);
         let label: string;
         if (winRate >= 0.7) {
             label = '胜算高';
@@ -1418,33 +1431,323 @@ export class GameState {
         }
     }
 
+    // ------------------------------------------------------------------
+    // AI：侦察 → 选主攻方向 → 集结 → 调将 → 征兵 → 多路协同进攻
+    //
+    // 旧 AI 只有一条规则「单城裸兵力比 > 1.15 就打」，后果是：
+    //   * 不看将领等级 / 君主加成 / 工事，手下名将再多也不进决策；
+    //   * 金币、粮草一分不花，国力纯摆设（探针里国库 1.6 万金躺到亡国）；
+    //   * 不会集结，兵按人口摊在几十座城，遇到玩家超编城 ratio 掉到 0.8
+    //     就整局零出兵 —— 「明明国力那么强却打不动」就是这么来的。
+    // 现在 AI 与玩家用同一套战力口径，并会主动把国力压到一个点上。
+    // ------------------------------------------------------------------
+
+    /**
+     * 「from 以给定兵力打 to」的战力比（纯试算，不改状态）
+     *
+     * 与 buildCombatSides / previewAttack 完全同一套参数：将领等级、君主加成、
+     * 守军工事都进倍率，只有兵力换成试算值。AI 靠它回答「还差多少兵才够」。
+     */
+    private aiPowerRatio(from: ProvinceState, to: ProvinceState, troops: number): number {
+        const { atkSide, defSide } = this.buildCombatSides(from, to);
+        const aMul = (1 + atkSide.atk * Balance.atkPerRating) * (atkSide.mul || 1);
+        const dMul = (1 + defSide.def * Balance.defPerRating) * (defSide.mul || 1)
+            * (1 + to.fort * Balance.fortPerPoint);
+        return Math.max(1, troops) * aMul / Math.max(1, defSide.troops * dMul);
+    }
+
+    /**
+     * 沿路网把境内余兵接力拉向主攻城，返回实际搬动的兵力
+     *
+     * 每座城保留 rearGarrisonRatio 的守备兵，只送「余兵」；兵只往离主攻城
+     * 更近一步的己方邻城走，远处的兵靠多 pass 一跳一跳传上来。允许超编
+     * （与玩家调兵同一条规则），但只在「还差多少兵」的缺口内搬，不无脑堆。
+     */
+    private aiConcentrate(fid: string, main: ProvinceState, need: number): number {
+        // BFS 出各城到主攻城的跳数
+        const dist = new Map<string, number>();
+        dist.set(main.id, 0);
+        const queue: ProvinceState[] = [main];
+        for (let i = 0; i < queue.length; i++) {
+            const cur = queue[i];
+            for (const id of cur.borders) {
+                const q = this.provinces.get(id);
+                if (!q || q.owner !== fid || dist.has(q.id)) {
+                    continue;
+                }
+                dist.set(q.id, (dist.get(cur.id) || 0) + 1);
+                queue.push(q);
+            }
+        }
+
+        let moved = 0;
+        for (let pass = 0; pass < Balance.redeployPasses && main.troops < need; pass++) {
+            let movedThisPass = 0;
+            // 远的先走，兵才能在同一回合接力到前线
+            const donors = this.provincesOf(fid)
+                .filter((p) => p.id !== main.id && dist.has(p.id))
+                .sort((a, b) => (dist.get(b.id) || 0) - (dist.get(a.id) || 0));
+            for (const from of donors) {
+                const d = dist.get(from.id) || 0;
+                const keep = Math.round(this.garrisonCap(from) * Balance.rearGarrisonRatio);
+                const spare = from.troops - keep;
+                if (spare <= 0) {
+                    continue;
+                }
+                let next: ProvinceState | null = null;
+                let nextD = d;
+                for (const id of from.borders) {
+                    const q = this.provinces.get(id);
+                    if (!q || q.owner !== fid) {
+                        continue;
+                    }
+                    const qd = dist.has(q.id) ? (dist.get(q.id) || 0) : 999;
+                    if (qd < nextD) {
+                        nextD = qd;
+                        next = q;
+                    }
+                }
+                if (!next) {
+                    continue;
+                }
+                let send = spare;
+                if (next.id === main.id) {
+                    send = Math.min(send, Math.max(0, need - main.troops));
+                }
+                if (send <= 0) {
+                    continue;
+                }
+                const before = next.troops;
+                // 不带将：将领调度由 aiAssignGenerals 单独按战力挑，
+                // 按比例随军会把名将留在后方、杂将送上前线。
+                this.moveTroops(from, next, send, false);
+                const delta = next.troops - before;
+                if (delta > 0) {
+                    movedThisPass += delta;
+                }
+            }
+            moved += movedThisPass;
+            if (movedThisPass === 0) {
+                break;
+            }
+        }
+        return Math.round(moved);
+    }
+
+    /**
+     * 把后方闲置名将调到主攻城，补到 generalsPerCity 参战上限
+     *
+     * 这是「手下将领那么多」真正变成战力的一步：以前 AI 的将领散在后方
+     * 从不参与决策，攻防等级白白浪费。每座后方城留一名守将，其余按攻击
+     * 等级择优随军。将领守恒不变（只是换城），不生成也不消失。
+     */
+    private aiAssignGenerals(fid: string, main: ProvinceState): number {
+        let room = Math.max(0, Balance.generalsPerCity - main.generals.length);
+        if (room <= 0) {
+            return 0;
+        }
+        const pool: Array<{ gid: string; from: ProvinceState; atk: number }> = [];
+        for (const p of this.provincesOf(fid)) {
+            if (p.id === main.id) {
+                continue;
+            }
+            for (const gid of p.generals.slice(1)) {
+                const g = this.generals.get(gid);
+                if (g) {
+                    pool.push({ gid, from: p, atk: g.def.atk + (g.level - 1) * 0.5 });
+                }
+            }
+        }
+        pool.sort((a, b) => b.atk - a.atk);
+        let moved = 0;
+        for (const item of pool) {
+            if (room <= 0) {
+                break;
+            }
+            const i = item.from.generals.indexOf(item.gid);
+            if (i < 0) {
+                continue;
+            }
+            item.from.generals.splice(i, 1);
+            main.generals.push(item.gid);
+            room--;
+            moved++;
+        }
+        return moved;
+    }
+
+    /**
+     * 集结仍不够时动用国库急征：每势力每回合有预算上限，不是无限爆兵
+     *
+     * 兵源不只有主攻城：它常被集结顶到超编上限，recruit 会一间也征不到，
+     * 于是国库越堆越高、钱完全花不出去（探针里后期躺着 2 万金）。同一
+     * 方向的其余相邻城正是协同第二路，补给它们既让钱有出口，也让夹击有兵。
+     */
+    private aiSpendTreasury(
+        fid: string, main: ProvinceState, target: ProvinceState, need: number,
+    ): number {
+        let budget = Math.min(this.gold.get(fid) || 0, Balance.aiRecruitBudget);
+        if (budget < Balance.goldPerTroop) {
+            return 0;
+        }
+        const sources: ProvinceState[] = [main];
+        for (const p of this.provincesOf(fid)) {
+            if (p.id !== main.id && this.isAdjacent(p, target)) {
+                sources.push(p);
+            }
+        }
+        let total = 0;
+        for (const p of sources) {
+            if (budget < Balance.goldPerTroop) {
+                break;
+            }
+            const gap = Math.max(0, need - p.troops);
+            const want = Math.min(
+                Math.floor(budget / Balance.goldPerTroop),
+                Math.ceil(gap),
+                Balance.recruitMax,
+            );
+            if (want <= 0) {
+                continue;
+            }
+            // 直接调底层 recruit：内政的 executeDomestic('recruit') 不允许超编，
+            // 而「临时集结」正是 AI 突破满编城要用的同一条玩家规则。
+            const got = this.recruit(p, want);
+            total += got;
+            budget -= got * Balance.goldPerTroop;
+        }
+        return total;
+    }
+
     /** 单个 AI 势力的行动 */
     private aiFactionAct(fid: string): void {
         const mine = this.provincesOf(fid);
-        // 优先级：兵力充足时进攻最弱的邻敌
+        if (mine.length === 0) {
+            return;
+        }
+
+        // 1) 侦察：每个可攻的敌城算一个「主攻方向」
+        const targets: Array<{ to: ProvinceState; value: number }> = [];
+        const seen = new Set<string>();
         for (const st of mine) {
-            if (st.troops < 500) {
-                continue;
-            }
-            const targets = this.attackTargets(st);
-            let best: ProvinceState | null = null;
-            let bestScore = 0;
-            for (const t of targets) {
-                const defPower = t.troops * (1 + t.fort * Balance.fortPerPoint);
-                const atkPower = st.troops;
-                const ratio = atkPower / Math.max(1, defPower);
-                // 大城更值得打
-                const value = t.def.city ? 1.25 : 1.0;
-                const score = ratio * value;
-                if (ratio > Balance.aiAttackRatio && score > bestScore) {
-                    best = t;
-                    bestScore = score;
+            for (const t of this.attackTargets(st)) {
+                if (seen.has(t.id)) {
+                    continue;
                 }
-            }
-            if (best) {
-                this.attack(st, best);
+                seen.add(t.id);
+                targets.push({
+                    to: t,
+                    // 大城更值钱；玩家城有额外权重，AI 不会只顾着互殴软柿子
+                    value: (t.def.city ? 1.25 : 1.0)
+                        * (t.owner === this.playerFaction ? Balance.aiPlayerTargetBias : 1.0),
+                });
             }
         }
+        if (targets.length === 0) {
+            return;
+        }
+
+        // 2) 每个方向先找当前最强的相邻己方城，按「胜算 × 价值」排序
+        const fronts: Array<{
+            to: ProvinceState; main: ProvinceState; ratio: number; score: number;
+        }> = [];
+        for (const t of targets) {
+            let main: ProvinceState | null = null;
+            let best = 0;
+            for (const p of mine) {
+                if (p.owner !== fid || p.attacked || !this.isAdjacent(p, t.to)) {
+                    continue;
+                }
+                const r = this.aiPowerRatio(p, t.to, p.troops);
+                if (r > best) {
+                    best = r;
+                    main = p;
+                }
+            }
+            if (main) {
+                fronts.push({ to: t.to, main, ratio: best,
+                    score: this.winRateOf(best) * t.value });
+            }
+        }
+        fronts.sort((a, b) => b.score - a.score);
+
+        // 3) 主攻方向：**只有它**能动用全国资源（集结 / 调将 / 国库）。
+        //    不这么分层的话，十几个势力每回合各自打五六路，一局能出兵 376 次，
+        //    玩家开局就被打回 6 座城 —— 「变聪明」不等于「变无脑爆兵」。
+        const cap = Balance.aiMaxAttacksPerFaction;
+        let attacks = 0;
+        const primary = fronts[0];
+        if (primary && primary.to.owner !== fid) {
+            const target = primary.to;
+            const main = primary.main;
+            const needOf = (): number => Math.ceil(
+                Balance.aiBreakthroughRatio
+                / Math.max(0.0001, this.aiPowerRatio(main, target, 1)));
+            let need = needOf();
+            if (main.troops < need) {
+                const moved = this.aiConcentrate(fid, main, need);
+                this.aiAssignGenerals(fid, main);
+                // 名将到位后每兵战力变了，缺口要重算，避免白征一堆兵
+                need = needOf();
+                if (main.troops < need) {
+                    this.aiSpendTreasury(fid, main, target, need);
+                }
+                if (moved > 0 && target.owner === this.playerFaction) {
+                    const f = FACTION_MAP[fid];
+                    this.pushLog(`${f ? f.name : fid} 自后方集结 ${moved} 兵于 `
+                        + `${main.name}，图谋 ${target.name}。`);
+                }
+            } else {
+                this.aiAssignGenerals(fid, main);
+            }
+            attacks += this.aiStrike(fid, target, cap, Balance.aiMaxAttacksPerTarget);
+        }
+
+        // 4) 主攻之外还有余力，就顺手捡软柿子：只用现成兵力，不再集结花钱。
+        //    这一层保证 AI 不会因为「主攻方向是块硬骨头」而整回合发呆。
+        for (let i = 1; i < fronts.length && i <= Balance.aiMaxFronts
+            && attacks < cap; i++) {
+            const front = fronts[i];
+            if (front.to.owner === fid) {
+                continue;
+            }
+            attacks += this.aiStrike(fid, front.to, cap - attacks, 1);
+        }
+    }
+
+    /**
+     * 对一座目标城组织进攻，返回实际出兵路数
+     *
+     * 每一波都重新算胜算：第一波削掉守军后，第二波可能就够了；反之若打崩了
+     * 自己人，下一波会自动收兵。协同不是排队送死，是逐波重估。
+     */
+    private aiStrike(
+        fid: string, target: ProvinceState, maxAttacks: number, maxWaves: number,
+    ): number {
+        let n = 0;
+        for (let wave = 0; wave < maxWaves && n < maxAttacks; wave++) {
+            if (target.owner === fid) {
+                break;
+            }
+            let chosen: ProvinceState | null = null;
+            let bestRate = Balance.aiMinWinRate;
+            for (const p of this.provincesOf(fid)) {
+                if (p.attacked || p.owner !== fid || !this.isAdjacent(p, target)) {
+                    continue;
+                }
+                const rate = this.winRateOf(this.aiPowerRatio(p, target, p.troops));
+                if (rate >= bestRate) {
+                    bestRate = rate;
+                    chosen = p;
+                }
+            }
+            if (!chosen) {
+                break;
+            }
+            this.attack(chosen, target);
+            n++;
+        }
+        return n;
     }
 
     /**

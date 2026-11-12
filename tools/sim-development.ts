@@ -334,12 +334,22 @@ console.log('\n== 7. AI 也会经营 ==');
         .filter((p) => p.owner !== g.playerFaction && p.owner !== 'neutral')
         .sort((a, b) => a.dev - b.dev)[0];
     const devBefore = aiCity.dev;
+    const ownerBefore = aiCity.owner;
     const logsBefore = g.logs.length;
     for (let i = 0; i < 6; i++) {
         g.endTurn();
     }
     const after = g.provinces.get(aiCity.id)!;
-    check(after.dev >= devBefore, `AI 城 ${after.name} 发展度没有倒退（${devBefore}→${after.dev}）`);
+    if (after.owner === ownerBefore) {
+        check(after.dev >= devBefore,
+            `AI 城 ${after.name} 发展度没有倒退（${devBefore}→${after.dev}）`);
+    } else {
+        // AI 现在会主动攻城：城池易主时 captureDevLoss 让发展度下降是正常的
+        // 战损机制，不是「治理把发展度刷低了」。这时只校验数值仍合法。
+        check(after.dev >= Balance.devMin && after.dev <= Balance.devMax,
+            `AI 城 ${after.name} 易主（${ownerBefore}→${after.owner}），`
+            + `发展度 ${devBefore}→${after.dev} 属攻占损失，数值仍合法`);
+    }
     // AI 治理必须传 log=false，否则十几个势力每回合刷满玩家战报
     const aiGovernLogs = g.logs.slice(logsBefore)
         .filter((s) => s.indexOf('治理') >= 0);

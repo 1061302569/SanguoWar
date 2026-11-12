@@ -8,6 +8,21 @@
  */
 import { GameState } from '../assets/scripts/core/GameState.ts';
 import { Balance } from '../assets/scripts/core/Balance.ts';
+import { setRandom } from '../assets/scripts/core/Combat.ts';
+
+// 长测也钉死随机源：以前直接吃 Math.random，同一份代码每次跑出的回合数、
+// 俘虏处置数都能差上几十，README 里的实测数字永远对不上，也复现不了偶发失败。
+// 与 sim-pace.ts / sim-ai.ts 用同一个 LCG，方便三份结果互相参照。
+// SG_SEED / SG_TURNS 可临时换种子和回合上限做扫描：被动玩家（只开自动治理、
+// 不主动集结）在 8 个固定种子里有 4 个 200 回合内打不完，这是「残局必须集结」
+// 的门槛而非死锁；会算胜率并集结的玩家由 sim-pace.ts 保证 6/6 通关。
+const SEED = Number(process.env.SG_SEED ?? 777);
+const TURN_LIMIT = Number(process.env.SG_TURNS ?? 200);
+let seed = SEED;
+setRandom(() => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+});
 
 const gs = new GameState();
 
@@ -22,13 +37,14 @@ function snapshot(label: string): void {
     );
 }
 
+console.log(`[长测] 固定种子 ${SEED} / 回合上限 ${TURN_LIMIT}`);
 snapshot('初始');
 
 let guard = 0;
 let captures = 0;
 let recruited = 0;
 let released = 0;
-while (!gs.isVictory() && !gs.isDefeat() && guard < 200) {
+while (!gs.isVictory() && !gs.isDefeat() && guard < TURN_LIMIT) {
     guard++;
 
     // 模拟玩家经营俘虏营：好招的招、死忠的放回去降忠诚（下次再抓更好招），
