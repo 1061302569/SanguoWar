@@ -118,10 +118,13 @@ console.log('\n== 连续进攻 50 次不崩 ==');
     });
     assert(negative === 0, '没有出现负兵力');
 
-    // 武将守恒
+    // 武将守恒：被生擒的将领在俘虏营，不在城上
     let placed = 0;
     gs.provinces.forEach((p) => { placed += p.generals.length; });
-    assert(placed === gs.generals.size, `武将守恒（${placed}/${gs.generals.size}）`);
+    let jailed = 0;
+    gs.generals.forEach((g) => { if (g.captiveOf !== '') jailed++; });
+    assert(placed + jailed === gs.generals.size,
+        `武将守恒（在城 ${placed} + 在营 ${jailed} / ${gs.generals.size}）`);
 }
 
 console.log('\n== 音效名与演出阶段匹配 ==');

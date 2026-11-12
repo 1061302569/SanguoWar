@@ -11,6 +11,14 @@ export interface CombatSide {
     def: number;
     /** 兵力上限，用于计算溢出损耗 */
     cap: number;
+    /**
+     * 额外战力倍率（君主加成等），不传按 1 算。
+     *
+     * 与 atk / def 分开是刻意的：等级和是**加法**（多带一个将就多一份），
+     * 君主加成是**乘法**（整体战力抬一个百分比）。把百分比折进等级和里，
+     * 就变成「将领越多、加成越被摊薄」，与「君威」的语义相反。
+     */
+    mul?: number;
 }
 
 /** 战斗中的上下文 */
@@ -30,6 +38,17 @@ let _rand = Math.random;
 /** 可注入随机源，便于测试与回放 */
 export function setRandom(fn: () => number): void {
     _rand = fn;
+}
+
+/**
+ * 取一个 [0, 1) 随机值。
+ *
+ * 战斗以外的规则（生擒、招降）也走这里，而不是各自写 Math.random()：
+ * 测试只要 setRandom() 一次就能把整局随机数钉死，否则「这次到底抓没抓到」
+ * 永远复现不了。
+ */
+export function random(): number {
+    return _rand();
 }
 
 /** 在 [min, max) 内取随机值 */
@@ -59,9 +78,10 @@ export function resolveBattle(ctx: CombatContext): BattleResult {
     const atkStart = atk.troops;
     const defStart = def.troops;
 
-    // 攻守双方战力：兵力 × 将领加成 × 工事加成
-    const atkMul = 1 + atk.atk * Balance.atkPerRating;
-    const defMul = (1 + def.def * Balance.defPerRating) * (1 + ctx.fort * Balance.fortPerPoint);
+    // 攻守双方战力：兵力 × 将领加成 × 君主加成 × 工事加成
+    const atkMul = (1 + atk.atk * Balance.atkPerRating) * (atk.mul || 1);
+    const defMul = (1 + def.def * Balance.defPerRating) * (def.mul || 1)
+        * (1 + ctx.fort * Balance.fortPerPoint);
 
     log.push(`${ctx.title}：${atkStart} 对 ${defStart}，工事 ${ctx.fort} 级`);
 
@@ -118,7 +138,10 @@ export function resolveBattle(ctx: CombatContext): BattleResult {
     } else if (atkLeft <= 0) {
         attackerWin = false;
     } else if (defLeft <= collapseLine) {
-        attackerWin = true;
+        // 守方崩线，但攻方自己也得没崩：同兵力硬拼时双方都会掉到崩溃线
+        // 以下，这时守在城里的那一方算守住 —— 否则「1:1 攻城」会判攻方胜，
+        // 守城方白守，城墙与工事全失去意义。
+        attackerWin = atkLeft > atkStart * Balance.collapseRatio;
     } else {
         // 都没有崩溃：按双方的相对剩余兵力比判定
         attackerWin = (atkLeft / Math.max(1, atkStart)) > (defLeft / Math.max(1, defStart)) * 1.15

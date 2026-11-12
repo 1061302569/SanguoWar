@@ -26,8 +26,21 @@ snapshot('初始');
 
 let guard = 0;
 let captures = 0;
+let recruited = 0;
+let released = 0;
 while (!gs.isVictory() && !gs.isDefeat() && guard < 200) {
     guard++;
+
+    // 模拟玩家经营俘虏营：好招的招、死忠的放回去降忠诚（下次再抓更好招），
+    // 君主只能放归。以前长测完全不处置，30+ 名将领一直躺在营里，
+    // 既测不到招降 / 放归，也把敌方守将全搬空、把战线推得虚高。
+    for (const g of gs.prisonersOf(gs.playerFaction)) {
+        if (g.def.ruler || gs.persuadeChance(g) < 0.4) {
+            if (gs.release(g.def.id).ok) released++;
+        } else if (gs.persuade(g.def.id).ok) {
+            recruited++;
+        }
+    }
 
     // 模拟玩家内政：**打开自动开关**，剩下的交给结束回合统一结算。
     // 需要救急的城先「登记」征兵（不立刻执行），这正是新交互想验证的用法：
@@ -70,6 +83,7 @@ snapshot('结束');
 console.log(`玩家占领：${gs.provincesOf(gs.playerFaction).length} / ${gs.provinces.size}`);
 console.log(`游戏内时长：${gs.turn} 回合（约 ${(gs.turn / 12).toFixed(1)} 年）`);
 console.log(`玩家攻占次数：${captures}`);
+console.log(`俘虏处置：招降成功 ${recruited} 人次 · 放归 ${released} 人次`);
 console.log(`胜利=${gs.isVictory()} 失败=${gs.isDefeat()}`);
 
 const alive: Record<string, number> = {};
@@ -80,4 +94,8 @@ console.log('\n存活势力：', Object.entries(alive)
 
 let placed = 0;
 gs.provinces.forEach((p) => { placed += p.generals.length; });
-console.log(`武将：总${gs.generals.size} 已安置${placed} ${placed === gs.generals.size ? '守恒' : '丢失!'}`);
+// 被生擒的将领关在俘虏营里，不在任何城上；守恒要按「在城 + 在营」算。
+let jailed = 0;
+gs.generals.forEach((g) => { if (g.captiveOf !== '') jailed++; });
+console.log(`武将：总${gs.generals.size} 在城${placed} 在营${jailed} `
+    + `${placed + jailed === gs.generals.size ? '守恒' : '丢失!'}`);

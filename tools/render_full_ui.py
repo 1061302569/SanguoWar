@@ -223,14 +223,23 @@ draw_text_at(-160, bar_cy - 20, '粮草 400', font_mid, (198, 232, 150, 255), 'l
 draw_text_at(-70, bar_cy + 22, '兵力 3073', font_mid, (200, 220, 255, 255), 'lm')
 draw_text_at(0, bar_cy - 20, '据点 3 / 35', font_mid, (200, 255, 200, 255), 'lm')
 
-# 静音 / 全图（顶栏子节点 x=292，y=±22，均在栏内）
-mb = (292 - 26, bar_cy + 22 - 20, 292 + 26, bar_cy + 22 + 20)
-draw_rect(mb, (50, 44, 34, 230), (170, 145, 95, 200))
-draw_text_at(292, bar_cy + 22, '声', font_mid, (240, 225, 190, 255))
-
-rb = (292 - 26, bar_cy - 22 - 20, 292 + 26, bar_cy - 22 + 20)
-draw_rect(rb, (50, 44, 34, 230), (170, 145, 95, 200))
-draw_text_at(292, bar_cy - 22, '全图', font_small, (240, 225, 190, 255))
+# 顶栏右侧 2x2 按钮区 + 俘虏营入口（x=168 下排）
+# 顶栏子节点坐标相对栏中心，四个按钮都收在 96px 高的栏内
+top_buttons = [
+    (292, 22, '声', False),
+    (292, -22, '全图', False),
+    (230, 22, '新局', False),
+    (230, -22, '路网', False),
+    # 营里有俘虏时亮底金边，这里按「有俘虏」的状态画
+    (168, -22, '俘虏', True),
+]
+for bx, by, text, lit in top_buttons:
+    b = (bx - 26, bar_cy + by - 20, bx + 26, bar_cy + by + 20)
+    draw_rect(b, (146, 106, 38, 255) if lit else (50, 44, 34, 230),
+              (255, 226, 138, 255) if lit else (170, 145, 95, 200),
+              3 if lit else 2)
+    draw_text_at(bx, bar_cy + by, text, font_small,
+                 (255, 240, 200, 255) if lit else (240, 225, 190, 255))
 
 # 结束回合（面板上方右侧）
 eb = widget_box(150, 60, right=20, bottom=316)
@@ -243,9 +252,15 @@ draw_text_at(hb[0] + 4, (hb[1] + hb[3]) / 2, '橙红路可进攻 · 绿/浅色�
              (255, 235, 180, 255), 'lm')
 
 # 战报（左上，顶栏下方）
+# 框里顺手写两行结算反馈，用来目视检查「后方补给 / 月募兵 / 内政」这几个
+# 新加进 toast 的字段会不会挤出 560px 的提示条（真实文案是单行，这里折成两行示意）。
 lb = widget_box(340, 96, left=16, top=108)
 d.rectangle(box_pil(*lb), outline=(120, 200, 255, 100), width=1)
 draw_text_at((lb[0] + lb[2]) / 2, lb[3] - 12, '战报 340x96', font_tiny, (120, 200, 255, 200))
+for k, line in enumerate(['新回合 +1240金 +680粮',
+                          '募400 补320 · 内政3城（自动2）']):
+    draw_text_at(lb[0] + 12, lb[3] - 42 - k * 26, line, font_tiny,
+                 (210, 225, 235, 235), 'lm')
 
 # 省份面板：底部抽屉 720x300
 pb = widget_box(720, 300, hcenter=0, bottom=0)
@@ -269,8 +284,13 @@ left_col = ['兵力 1800 / 2480', '人口 34　工事 4', '发展度 62 / 100',
             '守将 曹操(1)、夏侯惇(1)、典韦(1)']
 # 右栏第一行是全局自动方针（手动点内政键会改它，必须常驻可见）；
 # 第二行写清「选了还没执行」：内政只在结束回合统一结算。
+# 右栏末两行：本城君威加成与守将忠诚（君主驻哪座城、哪座城才吃加成，
+# 所以这里报的是「本城君主」，不是「势力君主」）。
+# 第 3 行按最新 UI 写：每个目标后挂战前胜算档位，且这座城本回合已出征时
+# 必须写明「本回合已出征」，否则玩家点进攻没反应会以为卡了。
 right_col = ['自动：治理 · 点内政键换', '待执行：治理（结束回合结算）',
-             '可攻：邺、南皮', '可调兵：许昌']
+             '可攻 邺·优（本回合已出征）', '可调兵：许昌',
+             '君威 曹操·唯才是举 降+15%', '忠诚 君曹操100、武夏侯惇95 等3人']
 ly = y1 - 56
 for i in range(max(len(left_col), len(right_col))):
     if i < len(left_col):
@@ -301,4 +321,61 @@ for bottom, texts in btn_rows:
 out = os.path.join(ROOT, 'tools', 'ui-preview.png')
 img.save(out)
 print(f'输出 {out}  {img.size}')
+
+# ---------- 俘虏营弹窗预览（同一张底图 + 模态遮罩）----------
+# 三个弹窗共用一层遮罩，这里单独画一张，用来目视检查行距 / 按钮是否挤出面板。
+prison_img = img.copy()
+d = ImageDraw.Draw(prison_img, 'RGBA')
+
+font_rule = load_font(17)
+font_row = load_font(19)
+font_row_bold = load_font(20, bold=True)
+
+# 遮罩
+d.rectangle([0, 0, VIEW_W, VIEW_H], fill=(10, 8, 6, 205))
+pp = widget_box(640, 780, hcenter=0)
+draw_rect(pp, (30, 25, 18, 252), (190, 160, 100, 230))
+draw_text_at(0, 342, '俘虏营 · 招降 / 放归', font_big, (255, 230, 170, 255))
+for j, line in enumerate([
+        '招降率 (100-忠诚)/100 + 君威；在位君主不可招降，失去所有城池后可招。',
+        '放归降 25 忠诚（旧主猜忌），下次被俘更好招。',
+        '招降失败反升 10 点，越劝越硬。 我方君威 降+15%']):
+    draw_text_at(-290, 306 - j * 26, line, font_rule, (215, 200, 170, 255), 'lm')
+
+# 按忠诚从低到高排，在位君主（100）沉底、亡国君主（70）浮上来；
+# 第 3 行就是「亡国后可招」的样子：身份变「旧主」，显示成功率与加成。
+# 第 4 行用敌方君主（袁绍）而不是玩家自己的曹操 —— 自家君主不可能被自己关进营里。
+sample = [
+    ('蔡瑁', '文官', '刘表', 55, '招降 45%', True),
+    ('张郃', '武将', '袁绍', 65, '招降 35%', True),
+    ('公孙度', '旧主', '辽东自守 守+20%', 70, '招降 45%', True),
+    ('袁绍', '君主', '四世三公 金+20%', 100, '不可招降', False),
+]
+for i, (name, role, sub, loyalty, chance, can_recruit) in enumerate(sample):
+    cy = 183 - i * 108
+    row = (-300, cy - 48, 300, cy + 48)
+    draw_rect(row, (48, 40, 30, 255), (150, 125, 80, 220))
+    color = (235, 205, 160, 255) if role in ('君主', '旧主') else (235, 230, 215, 255)
+    draw_text_at(-290, cy + 15, f'{name} · {role} · {sub}', font_row, color, 'lm')
+    draw_text_at(-290, cy - 15, f'忠诚 {loyalty} / 100 · {chance}', font_row, color, 'lm')
+    for bx, label, lit in [(150, '招降', can_recruit), (252, '放归', True)]:
+        b = (bx - 48, cy - 22, bx + 48, cy + 22)
+        draw_rect(b, (110, 76, 34, 255) if lit else (52, 48, 42, 255),
+                  (230, 190, 110, 255) if lit else (110, 105, 95, 200),
+                  2 if lit else 1)
+        draw_text_at(bx, cy, label, font_row_bold,
+                     (255, 240, 210, 255) if lit else (130, 125, 115, 255))
+
+draw_text_at(0, -215, '在押 4 人　第 1/1 页', font_small, (255, 230, 170, 255))
+for bx, label in [(-70, '< 上页'), (70, '下页 >')]:
+    b = (bx - 50, -285, bx + 50, -245)
+    draw_rect(b, (60, 50, 38, 255), (150, 125, 80, 220))
+    draw_text_at(bx, -265, label, font_tiny, (240, 225, 190, 255))
+cb = (-110, -363, 110, -307)
+draw_rect(cb, (70, 58, 42, 255), (190, 160, 100, 220))
+draw_text_at(0, -335, '返回战场', font_mid, (240, 225, 190, 255))
+
+prison_out = os.path.join(ROOT, 'tools', 'ui-prison-preview.png')
+prison_img.save(prison_out)
+print(f'输出 {prison_out}  {prison_img.size}')
 print(f'地图 {MAP_W:.0f}x{MAP_H:.0f}，初始缩放 {fit:.3f}')

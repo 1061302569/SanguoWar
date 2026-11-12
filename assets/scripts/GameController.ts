@@ -6,8 +6,9 @@ import { GameState, DomesticOrder, POLICY_NAME } from './core/GameState';
 import { Balance } from './core/Balance';
 import { Geo } from './core/Geo';
 import { MapCamera } from './core/MapCamera';
-import { ProvinceState } from './data/Types';
+import { GeneralState, ProvinceState, RulerBonus } from './data/Types';
 import { FACTION_MAP } from './data/Factions';
+import { ROLE_NAME, BONUS_KIND } from './data/Generals';
 import {
     DEFAULT_SCENARIO_ID, SCENARIOS, ScenarioDef, getScenario, playableFactions,
 } from './data/Scenarios';
@@ -122,6 +123,30 @@ export class GameController extends Component {
     private menuLayer: Node = null!;
     private scenarioPanel: Node = null!;
     private resultPanel: Node = null!;
+
+    // ---- 俘虏营 ----
+    /** 顶栏入口；有俘虏时亮金边，没有时保持暗色 */
+    private prisonBtn: Node = null!;
+    private prisonBtnLabel: Label = null!;
+    private prisonPanel: Node = null!;
+    private prisonInfo: Label = null!;
+    private prisonCount: Label = null!;
+    private prisonPrevBtn: Node = null!;
+    private prisonNextBtn: Node = null!;
+    /** 固定 4 行，内容按当前俘虏列表刷新（与剧本卡片同一套路） */
+    private prisonRows: Array<{
+        node: Node;
+        info: Label;
+        recruit: Node;
+        release: Node;
+        recruitLabel: Label;
+        releaseLabel: Label;
+    }> = [];
+    /** 当前 4 行分别对应的武将 id，按钮回调靠它反查 */
+    private prisonIds: string[] = [];
+    /** 俘虏营当前页（一页 4 人，超过 4 人可以翻页，不能让人凭空消失） */
+    private prisonPage = 0;
+    private static readonly PRISON_PER_PAGE = 4;
     private menuInfo: Label = null!;
     private menuSub: Label = null!;
     private resultTitle: Label = null!;
@@ -217,6 +242,12 @@ export class GameController extends Component {
             this.toast('内政键只做选择，点「结束回合」才统一执行；开「自动」则全境执行');
         }, 3400);
         this.pendingTimers.push(id2 as any);
+        // 最后一条讲出兵节奏：一城一回合只能出征一次、后方余兵会自动前送。
+        // 这两条不说明白，玩家要么以为「点了进攻没反应」，要么以为「兵怎么自己少了」。
+        const id3 = setTimeout(() => {
+            this.toast('每城一回合只能出征一次；后方余兵会自动补给到前线');
+        }, 6000);
+        this.pendingTimers.push(id3 as any);
     }
 
     onDestroy(): void {
@@ -359,6 +390,8 @@ export class GameController extends Component {
         this.menuLayer.active = true;
         this.scenarioPanel.active = true;
         this.resultPanel.active = false;
+        // 三个弹窗共用同一层遮罩，必须互斥：不然从俘虏营切过来会两层叠在一起
+        this.prisonPanel.active = false;
         this.refreshScenarioMenu();
     }
 
@@ -436,6 +469,7 @@ export class GameController extends Component {
         this.menuLayer.active = true;
         this.scenarioPanel.active = false;
         this.resultPanel.active = true;
+        this.prisonPanel.active = false;
 
         const sc = getScenario(this.state.scenarioId);
         const f = FACTION_MAP[this.state.playerFaction];
@@ -449,6 +483,162 @@ export class GameController extends Component {
             '',
             win ? '四海归一。换个剧本，或再来一把。' : '基业尽失。换个剧本，或再来一把。',
         ].join('\n');
+    }
+
+    // ==================================================================
+    // 俘虏营
+    //
+    // 因果链在 UI 上的落点：攻破敌城生擒 → 顶栏「俘虏」亮起 → 进营二选一
+    // （招降 / 放归）→ 成功率与忠诚变化全部问 state，这里只显示不另写判定。
+    // ==================================================================
+
+    /** 打开俘虏营：和剧本 / 结算面板互斥，共用同一层遮罩 */
+    private openPrisonMenu(): void {
+        this.prisonPage = 0;
+        this.menuLayer.active = true;
+        this.scenarioPanel.active = false;
+        this.resultPanel.active = false;
+        this.prisonPanel.active = true;
+        this.refreshPrisonMenu();
+        this.audio.play('click');
+    }
+
+    /** 俘虏营翻页 */
+    private onPrisonPage(delta: number): void {
+        this.prisonPage = Math.max(0, this.prisonPage + delta);
+        this.refreshPrisonMenu();
+        this.audio.play('click');
+    }
+
+    /** 重画一行的按钮明暗：在位君主的「招降」画暗（点了仍会给出明确原因） */
+    private paintPrisonButton(node: Node, label: Label, enabled: boolean): void {
+        const g = node.getComponent(Graphics);
+        if (g) {
+            g.clear();
+            g.fillColor = enabled ? new Color(110, 76, 34, 255) : new Color(52, 48, 42, 255);
+            g.strokeColor = enabled
+                ? new Color(230, 190, 110, 255)
+                : new Color(110, 105, 95, 200);
+            g.lineWidth = enabled ? 2 : 1;
+            g.rect(-48, -22, 96, 44);
+            g.fill();
+            g.stroke();
+        }
+        label.color = enabled
+            ? new Color(255, 240, 210, 255)
+            : new Color(130, 125, 115, 255);
+    }
+
+    /** 刷新俘虏营：名单 / 成功率 / 页码 / 按钮明暗全部来自 state */
+    private refreshPrisonMenu(): void {
+        // 按忠诚从低到高排：最容易招降的排最前；在位君主忠诚高，自然沉底
+        const list = this.state.prisonersOf(this.state.playerFaction).slice()
+            .sort((a, b) => a.loyalty - b.loyalty);
+        const pages = Math.max(1, Math.ceil(list.length / GameController.PRISON_PER_PAGE));
+        // 处置掉一个人后名单变短，页码要收回来，别停在空白页
+        this.prisonPage = Math.min(this.prisonPage, pages - 1);
+        const start = this.prisonPage * GameController.PRISON_PER_PAGE;
+        const visible = list.slice(start, start + GameController.PRISON_PER_PAGE);
+
+        // 规则写在脸上：成功率、放归降忠诚、招降失败反升，都是公开数值。
+        // 「在位」两个字是关键：不写清楚，玩家会以为君主永远招不了，
+        // 攻灭一国时也就不会想到「把君主也抓过来」这条线。
+        const persuadeBonus = this.state.persuadeBonus();
+        this.prisonInfo.string = [
+            '招降率 (100-忠诚)/100；在位君主不可招降，失去所有城池后可招。',
+            `放归降 ${Balance.releaseLoyaltyDrop} 忠诚（旧主猜忌），下次被俘更好招。`,
+            `招降失败反升 ${Balance.persuadeFailLoyaltyGain} 点，越劝越硬。`
+                + (persuadeBonus > 0
+                    ? ` 我方君威 降+${Math.round(persuadeBonus * 100)}%` : ''),
+        ].join('\n');
+        this.prisonCount.string = list.length === 0
+            ? '俘虏营空无一人 · 攻破敌城按概率生擒守将'
+            : `在押 ${list.length} 人　第 ${this.prisonPage + 1}/${pages} 页`;
+        this.prisonPrevBtn.active = pages > 1 && this.prisonPage > 0;
+        this.prisonNextBtn.active = pages > 1 && this.prisonPage < pages - 1;
+
+        this.prisonIds = [];
+        this.prisonRows.forEach((row, i) => {
+            const g = visible[i];
+            row.node.active = !!g;
+            this.prisonIds.push(g ? g.def.id : '');
+            if (!g) {
+                return;
+            }
+            const f = FACTION_MAP[g.faction];
+            // 在位 / 亡国是两套结果：在位君主恒 0%，亡国君主按忠诚算。
+            // 按钮明暗、成功率文本全部由 isReigning() 一个判定驱动，不各写一套。
+            const reigning = this.state.isReigning(g);
+            const chance = this.state.persuadeChance(g);
+            const chanceText = reigning ? '不可招降' : `招降 ${Math.round(chance * 100)}%`;
+            const roleText = g.def.ruler
+                ? (reigning ? '君主' : '旧主')
+                : ROLE_NAME[g.def.role];
+            // 君主报称号与加成（这才是招降他的理由），其他人报原属势力
+            const sub = g.def.bonus
+                ? `${g.def.bonus.title} ${this.bonusText(g.def.bonus)}`
+                : (f ? f.name : g.faction);
+            row.info.string = `${g.def.name} · ${roleText} · ${sub}\n`
+                + `忠诚 ${g.loyalty}/${Balance.loyaltyMax} · ${chanceText}`;
+            row.info.color = g.def.ruler
+                ? new Color(235, 205, 160, 255)
+                : new Color(235, 230, 215, 255);
+            this.paintPrisonButton(row.recruit, row.recruitLabel, !reigning);
+            this.paintPrisonButton(row.release, row.releaseLabel, true);
+        });
+    }
+
+    /** 招降第 i 行：成功则改旗易帜并安置，失败忠诚上升 */
+    private onPrisonRecruit(index: number): void {
+        const gid = this.prisonIds[index];
+        if (!gid) {
+            return;
+        }
+        const res = this.state.persuade(gid);
+        this.showcase.playClick();
+        this.audio.play(res.ok ? 'capture' : 'fail');
+        this.toast(res.reason);
+        this.saveGame();
+        this.refreshAll();
+        this.refreshPrisonMenu();
+    }
+
+    /** 放归第 i 行：回原势力并降忠诚，为下次招降铺路 */
+    private onPrisonRelease(index: number): void {
+        const gid = this.prisonIds[index];
+        if (!gid) {
+            return;
+        }
+        const res = this.state.release(gid);
+        this.showcase.playClick();
+        this.audio.play(res.ok ? 'click' : 'fail');
+        this.toast(res.reason);
+        this.saveGame();
+        this.refreshAll();
+        this.refreshPrisonMenu();
+    }
+
+    /** 顶栏「俘虏」：营里有人时亮底金边，不用玩家自己记着抓了谁 */
+    private refreshPrisonButton(): void {
+        if (!this.prisonBtn || !this.prisonBtn.isValid) {
+            return;
+        }
+        const count = this.state.prisonersOf(this.state.playerFaction).length;
+        const g = this.prisonBtn.getComponent(Graphics);
+        if (g) {
+            g.clear();
+            g.fillColor = count > 0 ? new Color(146, 106, 38, 255) : new Color(50, 44, 34, 230);
+            g.strokeColor = count > 0
+                ? new Color(255, 226, 138, 255)
+                : new Color(170, 145, 95, 200);
+            g.lineWidth = count > 0 ? 3 : 2;
+            g.rect(-26, -20, 52, 40);
+            g.fill();
+            g.stroke();
+        }
+        this.prisonBtnLabel.color = count > 0
+            ? new Color(255, 240, 200, 255)
+            : new Color(240, 225, 190, 255);
     }
 
     // ==================================================================
@@ -652,6 +842,18 @@ export class GameController extends Component {
             size: 18, color: new Color(240, 225, 190, 255), bold: true,
         }, resetBtn);
         resetBtn.on(Node.EventType.TOUCH_END, this.onResetView, this);
+
+        // ---- 俘虏营入口 ----
+        // 顶栏第三列（x=168）的下排，和「路网 / 全图」一行。
+        // 文字固定两个字，不往 52px 按钮里塞数字；有俘虏时改用亮底金边表达。
+        const prisonBtn = makeRectStroke('PrisonBtn', 52, 40,
+            new Color(50, 44, 34, 230), new Color(170, 145, 95, 200), 2, bar);
+        setPos(prisonBtn, 168, -22);
+        this.prisonBtn = prisonBtn;
+        this.prisonBtnLabel = makeLabel('PrisonTxt', '俘虏', {
+            size: 18, color: new Color(240, 225, 190, 255), bold: true,
+        }, prisonBtn);
+        prisonBtn.on(Node.EventType.TOUCH_END, this.openPrisonMenu, this);
 
         // ---- 提示条 ----
         // 面板占据底部 300px，提示条移到面板上方，避免被盖住
@@ -947,6 +1149,95 @@ export class GameController extends Component {
             size: 24, color: new Color(210, 200, 180, 255), bold: true,
         }, stayBtn);
         stayBtn.on(Node.EventType.TOUCH_END, () => this.hideMenu(), this);
+
+        // ---------------- 俘虏营 ----------------
+        // 第三个共用遮罩的弹窗：攻破敌城生擒的守将在这里二选一处置。
+        // 一页 4 行、卡片复用（和剧本卡片同一套路），不按人数动态造节点。
+        const pp = makeRectStroke('PrisonPanel', 640, 780,
+            new Color(30, 25, 18, 252), new Color(190, 160, 100, 230), 2, mask);
+        addWidget(pp, { hCenter: 0, vCenter: 0 });
+        pp.active = false;
+        this.prisonPanel = pp;
+
+        const pTitle = makeLabel('PrisonTitle', '俘虏营 · 招降 / 放归', {
+            size: 32, color: new Color(255, 230, 170, 255), bold: true,
+        }, pp);
+        setPos(pTitle.node, 0, 342);
+
+        // 规则写在脸上：成功率、放归降忠诚、招降失败反升，全部是公开数值
+        this.prisonInfo = makeLabel('PrisonInfo', '', {
+            size: 17, color: new Color(215, 200, 170, 255),
+            align: HorizontalTextAlignment.LEFT, width: 580, height: 84, lineHeight: 26,
+        }, pp);
+        setPos(this.prisonInfo.node, 0, 280);
+
+        for (let i = 0; i < GameController.PRISON_PER_PAGE; i++) {
+            const row = makeRectStroke(`PrisonRow_${i}`, 600, 96,
+                new Color(48, 40, 30, 255), new Color(150, 125, 80, 220), 2, pp);
+            // 从 183 起排：给上方三行规则说明留出 12px 安全间距，别贴着卡片边框
+            setPos(row, 0, 183 - i * 108);
+            const info = makeLabel(`PrisonRowInfo_${i}`, '', {
+                size: 19, color: new Color(235, 230, 215, 255),
+                align: HorizontalTextAlignment.LEFT, width: 380, height: 68, lineHeight: 30,
+            }, row);
+            setPos(info.node, -100, 0);
+
+            const recruit = makeRectStroke(`PrisonRecruit_${i}`, 96, 44,
+                new Color(110, 76, 34, 255), new Color(230, 190, 110, 255), 2, row);
+            setPos(recruit, 150, 0);
+            const recruitLabel = makeLabel(`PrisonRecruitTxt_${i}`, '招降', {
+                size: 20, color: new Color(255, 240, 210, 255), bold: true,
+            }, recruit);
+            recruit.on(Node.EventType.TOUCH_END, () => this.onPrisonRecruit(i), this);
+
+            const release = makeRectStroke(`PrisonRelease_${i}`, 96, 44,
+                new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, row);
+            setPos(release, 252, 0);
+            const releaseLabel = makeLabel(`PrisonReleaseTxt_${i}`, '放归', {
+                size: 20, color: new Color(240, 225, 190, 255), bold: true,
+            }, release);
+            release.on(Node.EventType.TOUCH_END, () => this.onPrisonRelease(i), this);
+
+            this.prisonRows.push({
+                node: row, info, recruit, release, recruitLabel, releaseLabel,
+            });
+        }
+
+        this.prisonCount = makeLabel('PrisonCount', '', {
+            size: 19, color: new Color(255, 230, 170, 255), bold: true,
+        }, pp);
+        setPos(this.prisonCount.node, 0, -215);
+
+        this.prisonPrevBtn = makeRectStroke('PrisonPrevBtn', 100, 40,
+            new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, pp);
+        setPos(this.prisonPrevBtn, -70, -265);
+        makeLabel('PrisonPrevTxt', '< 上页', {
+            size: 18, color: new Color(240, 225, 190, 255), bold: true,
+        }, this.prisonPrevBtn);
+        this.prisonPrevBtn.on(Node.EventType.TOUCH_END, () => this.onPrisonPage(-1), this);
+
+        this.prisonNextBtn = makeRectStroke('PrisonNextBtn', 100, 40,
+            new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, pp);
+        setPos(this.prisonNextBtn, 70, -265);
+        makeLabel('PrisonNextTxt', '下页 >', {
+            size: 18, color: new Color(240, 225, 190, 255), bold: true,
+        }, this.prisonNextBtn);
+        this.prisonNextBtn.on(Node.EventType.TOUCH_END, () => this.onPrisonPage(1), this);
+
+        const closeBtn = makeRectStroke('PrisonCloseBtn', 220, 56,
+            new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, pp);
+        setPos(closeBtn, 0, -335);
+        makeLabel('PrisonCloseTxt', '返回战场', {
+            size: 23, color: new Color(240, 225, 190, 255), bold: true,
+        }, closeBtn);
+        closeBtn.on(Node.EventType.TOUCH_END, () => {
+            // 从结算面板切过来时，「返回战场」应回到结算，别把重开入口弄丢
+            if (this.gameOverShown) {
+                this.showResult(this.state.isVictory());
+            } else {
+                this.hideMenu();
+            }
+        }, this);
     }
 
     private buildPanel(root: Node): void {
@@ -1207,6 +1498,95 @@ export class GameController extends Component {
         this.syncRouteFocus();
     }
 
+    /**
+     * 将领身份短标：君 / 旧 / 武 / 文。
+     * 右栏一行只有 330px，写全「武将」「文官」会把两栏挤歪，
+     * 所以这里取身份名首字；俘虏营里用完整的 ROLE_NAME。
+     * 「旧」= 已归降的旧主：他不再是君主，但也不是普通降将，标出来免得
+     * 玩家以为自己的君主换人了。
+     */
+    private generalMark(g: GeneralState): string {
+        if (g.def.ruler) {
+            return this.state.isReigning(g) ? '君' : '旧';
+        }
+        return ROLE_NAME[g.def.role].charAt(0);
+    }
+
+    /**
+     * 战前胜算的单字短标：挂在可攻目标名后面，右栏宽度有限，
+     * 完整档位（胜算高 / 偏优 / 偏险 / 慎攻）只在敌方城主攻方向上写全。
+     */
+    private previewTag(from: ProvinceState, to: ProvinceState): string {
+        const pv = this.state.previewAttack(from, to);
+        switch (pv.label) {
+            case '胜算高': return '高';
+            case '胜算偏优': return '优';
+            case '胜算偏险': return '险';
+            default: return '慎';
+        }
+    }
+
+    /** 君主加成的显示文本：按 BONUS_KIND 的顺序拼，UI 不各写一套 if */
+    private bonusText(b: RulerBonus): string {        const parts: string[] = [];
+        for (const k of BONUS_KIND) {
+            const v = b[k.key];
+            if (v) {
+                parts.push(`${k.name}+${Math.round(v * 100)}%`);
+            }
+        }
+        return parts.join(' ');
+    }
+
+    /**
+     * 君主一行：**只看这座城**。
+     *
+     * 加成只作用于君主驻守的那座城，所以这里报的是「本城君主 + 他的加成」，
+     * 而不是势力君主 —— 玩家把君主调到哪、哪座城才吃到加成，这是一步
+     * 可以操作的决策，UI 必须让它看得见。君主不在这座城时改报他此刻在哪，
+     * 玩家才知道该往哪调（这也是「招来的旧主该安置到哪」的决策依据）。
+     *
+     * 忠诚不在这里重复：loyaltyLine() 已经列出守将忠诚，含君主本人。
+     */
+    private rulerLine(p: ProvinceState): string {
+        const rulers = this.state.generalsAt(p).filter((g) => !!g.def.bonus);
+        if (rulers.length > 0) {
+            const head = rulers[0];
+            const title = head.def.bonus ? head.def.bonus.title : '';
+            // 加成按「本城**实际生效**的值」逐项拼，不是照抄某位君主的配置：
+            // 同城多位君主时 rulerBonusAt 是按项取最高，照抄一位就会显示错。
+            const parts: string[] = [];
+            for (const k of BONUS_KIND) {
+                const v = this.state.rulerBonusAt(p, k.key);
+                if (v) {
+                    parts.push(`${k.name}+${Math.round(v * 100)}%`);
+                }
+            }
+            return `君威 ${head.def.name}·${title} ${parts.join(' ')}`;
+        }
+        const ruler = this.state.rulerStateOf(p.owner);
+        if (!ruler) {
+            return '君主 —（此势力无君主）';
+        }
+        if (ruler.captiveOf !== '') {
+            return `君主 ${ruler.def.name}（被俘）`;
+        }
+        const where = this.state.cityOfGeneral(ruler.def.id);
+        return where
+            ? `君主 ${ruler.def.name}（在 ${where.name}）`
+            : `君主 ${ruler.def.name}（无城）`;
+    }
+
+    /** 守将忠诚：最多列 2 位，其余写「等 N 人」，避免撑破右栏 */
+    private loyaltyLine(p: ProvinceState): string {
+        const gen = this.state.generalsAt(p);
+        if (gen.length === 0) {
+            return '忠诚 —（无守将）';
+        }
+        const shown = gen.slice(0, 2)
+            .map((g) => `${this.generalMark(g)}${g.def.name}${g.loyalty}`).join('、');
+        return `忠诚 ${shown}${gen.length > 2 ? ` 等${gen.length}人` : ''}`;
+    }
+
     private showPanel(p: ProvinceState): void {
         const f = FACTION_MAP[p.owner];
         const gen = this.state.generalsAt(p);
@@ -1256,18 +1636,45 @@ export class GameController extends Component {
             } else if (targets.length === 0) {
                 right.push('⚠ 四周无敌军，暂时无法扩张');
             } else {
-                right.push(`可攻：${targets.map((t) => t.name).join('、')}`);
+                // 每个可攻目标挂上战前胜算档位：玩家点进攻前就能看出哪座好打，
+                // 不用先摸上去打一仗才知道打不动。预估只是参考，实战仍有浮动。
+                const names = targets.map((t) => `${t.name}·${this.previewTag(p, t)}`).join('、');
+                // 出征过的城要说清楚：不然玩家会以为「点进攻没反应」。
+                // 一座城一回合只能打一次，这是节奏的来源，必须可见。
+                right.push(p.attacked
+                    ? `可攻 ${names}（本回合已出征）`
+                    : `可攻：${names}`);
             }
             const allies = this.state.moveTargets(p);
             if (allies.length > 0) {
                 right.push(`可调兵：${allies.map((t) => t.name).join('、')}`);
             }
+            // 君主与守将忠诚常驻：放归降的忠诚会落到对面城上，
+            // 玩家要能在这里看见「下次更好招」确实发生了。
+            right.push(this.rulerLine(p));
+            right.push(this.loyaltyLine(p));
         } else {
             const myNeighbors = this.state.provincesOf(this.state.playerFaction)
                 .filter((q) => this.state.isAdjacent(q, p));
-            right = myNeighbors.length === 0
-                ? ['（我方与他并不接壤）']
-                : [`可从：${myNeighbors.map((q) => q.name).join('、')} 进攻`];
+            if (myNeighbors.length === 0) {
+                right.push('（我方与他并不接壤）');
+            } else {
+                // 取胜算最高的邻城作为主攻方向，档位写在后面；其余邻城只列名字
+                let best = myNeighbors[0];
+                let bestPv = this.state.previewAttack(best, p);
+                for (const q of myNeighbors.slice(1)) {
+                    const pv = this.state.previewAttack(q, p);
+                    if (pv.winRate > bestPv.winRate) {
+                        best = q;
+                        bestPv = pv;
+                    }
+                }
+                right.push(`可从：${myNeighbors.map((q) => q.name).join('、')} 进攻`
+                    + `（${best.name} ${bestPv.label}）`);
+            }
+            // 打之前先看清楚守将忠不忠：忠诚低的城，打下来更容易收人
+            right.push(this.rulerLine(p));
+            right.push(this.loyaltyLine(p));
         }
 
         // 用制表符对齐两栏（Label 不支持分栏，用等宽间距近似）
@@ -1408,6 +1815,10 @@ export class GameController extends Component {
         // 记录战斗前的数值，用于飘字（atkLoss / defLoss 要靠前后差值算）
         const fromTroopsBefore = from.troops;
         const toTroopsBefore = to.troops;
+        // 俘虏不在任何城上，战报里不点名玩家很容易漏看；
+        // 记住战前在押名单，打完做差集就能准确报出「这仗抓了谁」。
+        const prisonersBefore = new Set(
+            this.state.prisonersOf(this.state.playerFaction).map((g) => g.def.id));
 
         // 先结算，再演出：数值是真相，动画只是表现。
         // 即使动画被切后台打断，战斗结果也已经在 state 里定下来了。
@@ -1420,10 +1831,14 @@ export class GameController extends Component {
         const atkLoss = Math.max(0, fromTroopsBefore - from.troops);
         const defLoss = Math.max(0, toTroopsBefore - to.troops);
         const garrison = res.captured ? to.troops : 0;
+        const newPrisoners = this.state.prisonersOf(this.state.playerFaction)
+            .filter((g) => !prisonersBefore.has(g.def.id))
+            .map((g) => g.def.name);
 
         // 战斗结果即时提示（不依赖战报面板，玩家一眼能看到）
         if (res.captured) {
-            this.toast(`⚔ 攻占 ${to.name}！驻军 ${garrison}，缴获 ${res.loot} 金`);
+            const captureTip = newPrisoners.length > 0 ? ` · 俘${newPrisoners.length}人` : '';
+            this.toast(`⚔ 攻占 ${to.name}！驻军 ${garrison}，缴获 ${res.loot} 金${captureTip}`);
         } else {
             this.toast(`⚔ 进攻 ${to.name} 失利，我军折损 ${atkLoss}`);
         }
@@ -1452,6 +1867,11 @@ export class GameController extends Component {
                 this.selectProvince(nextSel);
                 if (!res.captured) {
                     this.toast(`${from.name} 兵力 ${from.troops}，可征兵后再攻`);
+                } else if (newPrisoners.length > 0) {
+                    // 演出播完再点名：告诉玩家去哪处置，别让俘虏躺在营里没人管
+                    const names = newPrisoners.slice(0, 2).join('、')
+                        + (newPrisoners.length > 2 ? ` 等${newPrisoners.length}人` : '');
+                    this.toast(`生擒 ${names} · 点顶栏「俘虏」招降 / 放归`);
                 }
                 // 打下最后一城时，等演出播完再弹结算，避免遮住动画
                 this.checkGameOver();
@@ -1478,15 +1898,25 @@ export class GameController extends Component {
     }
 
     private doMove(from: ProvinceState, to: ProvinceState): void {
-        const amount = Math.floor(from.troops * 0.5);
+        // 调兵的含义是「把兵送到需要的地方」，所以默认把目标城填满，
+        // 出发城只留 100 的最低守备。旧版固定调一半：想把后方兵送到前线，
+        // 得点三四次、过两三个中转城，每次只剩一半，纯体力活 —— 而真正的
+        // 「后方→一线」已经由结束回合的自动补给接管，这里留给玩家的
+        // 是精确操作：前线城之间挪兵，集中一点突破。
+        const room = Math.max(0, this.state.garrisonCap(to) - to.troops);
+        const amount = Math.min(room, Math.max(0, from.troops - 100));
         const moved = this.state.moveTroops(from, to, amount);
         if (moved) {
             this.showcase.playClick();
             // 调兵给一点数字反馈，让玩家看见兵力流动
-            const actual = Math.min(amount, to.troops);
-            if (actual > 0) {
-                this.animator.popText(to, `+${actual}`, true);
+            if (amount > 0) {
+                this.animator.popText(to, `+${amount}`, true);
+                this.toast(`${from.name} → ${to.name} 调兵 ${amount}`);
             }
+        } else if (room <= 0) {
+            this.toast(`${to.name} 驻军已满（上限 ${this.state.garrisonCap(to)}），先攻城或换目标`);
+        } else {
+            this.toast(`${from.name} 兵力不足，至少留 100 守备`);
         }
         this.refreshAll();
         this.selectProvince(to);
@@ -1656,7 +2086,10 @@ export class GameController extends Component {
             // 把本回合的钱粮与月募兵一起报出来：发展度机制的效果
             // 平时藏在数值里，结算这一下是玩家唯一能直观看到回报的时机。
             const eco = `+${report.goldIncome}金 +${report.foodIncome}粮`;
-            const rein = report.reinforced > 0 ? ` 募兵${report.reinforced}` : '';
+            const rein = report.reinforced > 0 ? ` 募${report.reinforced}` : '';
+            // 后方补给搬了多少兵也要报：兵是自动往前线走的，玩家不点任何东西，
+            // 不说明一句就会觉得「我的兵怎么自己跑了」。
+            const redeploy = report.redeployed > 0 ? ` 补${report.redeployed}` : '';
             // 本回合到底执行了几城内政也要说一声：玩家回合内只是「选」，
             // 到这一刻才真正结算，没有反馈就会以为按钮白点了。
             // toast 是单行不换行的（560px 宽），所以和失守提示二选一，别堆在一起。
@@ -1666,7 +2099,7 @@ export class GameController extends Component {
                 : '';
             this.toast(lostTip
                 ? `${lostTip}新回合 ${eco}`
-                : `新回合 ${eco}${rein}${auto}`);
+                : `新回合 ${eco}${rein}${redeploy}${auto}`);
         }
     }
 
@@ -1751,7 +2184,10 @@ export class GameController extends Component {
             this.toastNode.destroy();
         }
 
-        const n = makeBox('Toast', 560, 64, this.node);
+        // 模态层盖在 HUD 之上（createMenu 最后创建），招降 / 放归的反馈
+        // 如果还挂在 this.node 上就会被遮罩挡住。弹窗开着时挂到遮罩层去。
+        const host = this.menuLayer && this.menuLayer.active ? this.menuLayer : this.node;
+        const n = makeBox('Toast', 560, 64, host);
         const bg = n.addComponent(Graphics);
         bg.fillColor = new Color(24, 20, 14, 235);
         bg.strokeColor = new Color(200, 170, 105, 220);
@@ -1822,6 +2258,11 @@ export class GameController extends Component {
         // 读档 / 换势力 / 新局后，自动开关与高亮要显示存档里的状态
         this.refreshAutoButton();
         this.refreshDomesticButtons();
+        // 攻下城池可能生擒守将，顶栏「俘虏」要立刻亮；营正开着时名单也要跟着变
+        this.refreshPrisonButton();
+        if (this.prisonPanel && this.prisonPanel.active) {
+            this.refreshPrisonMenu();
+        }
         if (this.selected) {
             this.showPanel(this.selected);
         }

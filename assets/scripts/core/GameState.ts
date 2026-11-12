@@ -2,12 +2,14 @@ import { Balance } from './Balance';
 import { Geo } from './Geo';
 import { FACTIONS, FACTION_MAP, NEUTRAL } from '../data/Factions';
 import { PROVINCES } from '../data/Provinces';
-import { GENERALS } from '../data/Generals';
+import { GENERALS, RULER_OF } from '../data/Generals';
 import {
     DEFAULT_SCENARIO_ID, ScenarioDef, getScenario, playableFactions,
 } from '../data/Scenarios';
-import { FactionDef, GeneralState, ProvinceState, DomesticOrderKey } from '../data/Types';
-import { resolveBattle, CombatSide } from './Combat';
+import {
+    FactionDef, GeneralDef, GeneralState, ProvinceState, DomesticOrderKey, RulerBonusKey,
+} from '../data/Types';
+import { resolveBattle, CombatSide, random } from './Combat';
 
 /** 每回合产生的财政报告 */
 export interface TurnReport {
@@ -20,6 +22,8 @@ export interface TurnReport {
     autoOrders: number;
     /** 本回合实际执行了内政的城数（手动 + 自动，每城最多 1） */
     domesticOrders: number;
+    /** 本回合后方补给自动送往一线的兵力 */
+    redeployed: number;
     popTotal: number;
     provinceCount: number;
     /** 本回合 AI 阶段从玩家手里夺走的城池 id（用于失守提示与 UI 校验） */
@@ -221,7 +225,15 @@ export class GameState {
         }
 
         for (const def of GENERALS) {
-            this.generals.set(def.id, { def, level: 1, exp: 0 });
+            this.generals.set(def.id, {
+                def,
+                level: 1,
+                exp: 0,
+                faction: def.faction,
+                loyalty: Math.max(Balance.loyaltyMin,
+                    Math.min(Balance.loyaltyMax, def.loyalty)),
+                captiveOf: '',
+            });
         }
 
         this.placeGenerals(sc);
@@ -276,7 +288,14 @@ export class GameState {
 
     /** 指定人口下的驻军上限（征兵会改人口，必须能按「未来人口」试算） */
     private capAt(st: ProvinceState, pop: number): number {
-        return Math.round(pop * Balance.garrisonCapPerPop + (st.def.city ? 800 : 0));
+        // 驻军容量按「城池规模」定：取当前人口与初始人口的较大者。
+        // 城被反复攻打后人口会掉到个位数，若上限跟着掉，走廊城就变成死锁
+        // （北平人口 6 → 上限 286，后方几万兵送不进来，最后一座城永远打不下）。
+        // 人口仍然决定收入与募兵，所以「打烂的城」依然虚弱，只是不会卡死。
+        const base = Math.max(pop, st.def.pop);
+        const raw = base * Balance.garrisonCapPerPop + (st.def.city ? 800 : 0);
+        // 保底见 Balance.garrisonCapMin：人口基数特别小的城也要能驻军
+        return Math.round(Math.max(raw, Balance.garrisonCapMin));
     }
 
     /** 省份驻军上限 */
@@ -305,15 +324,23 @@ export class GameState {
         return 1 + (st.dev / 100) * Balance.devOutputFactor;
     }
 
-    /** 省份每月金币收入：人口 × 大城加成 × 发展度倍率 */
+    /**
+     * 省份每月金币收入：人口 × 大城加成 × 发展度倍率 × 君主加成
+     *
+     * 君主加成只认**驻守在这座城**的君主（见 rulerBonusAt），
+     * 所以把君主调到哪里、哪座城的月收就抬起来 —— 这是一步可以操作的决策，
+     * 不是一个「招到就永久全局 +20%」的被动数值。
+     */
     public provinceIncome(st: ProvinceState): number {
         const cityBonus = st.def.city ? 1.35 : 1;
-        return Math.round(st.pop * Balance.incomePerPop * cityBonus * this.devFactor(st));
+        const ruler = 1 + this.rulerBonusAt(st, 'gold');
+        return Math.round(st.pop * Balance.incomePerPop * cityBonus * this.devFactor(st) * ruler);
     }
 
-    /** 省份每月粮草产出：人口 × 发展度倍率 */
+    /** 省份每月粮草产出：人口 × 发展度倍率 × 君主加成 */
     public foodIncome(st: ProvinceState): number {
-        return Math.round(st.pop * Balance.foodPerPop * this.devFactor(st));
+        const ruler = 1 + this.rulerBonusAt(st, 'food');
+        return Math.round(st.pop * Balance.foodPerPop * this.devFactor(st) * ruler);
     }
 
     /**
@@ -373,16 +400,283 @@ export class GameState {
         return out;
     }
 
-    /** 将领等级之和 */
+    /**
+     * 将领等级之和（只取战力最高的 generalsPerCity 名参战）
+     *
+     * 一座城协同守城/出征的战将有限：亡国降将全堆到同一座城时，超出上限
+     * 的守将不再把攻防等级一层层叠上去（见 Balance.generalsPerCity）。
+     * 将领本人仍在城上、守恒不变，只是不计入战力。
+     */
     private sumGeneralRating(st: ProvinceState, key: 'atk' | 'def'): number {
-        let sum = 0;
+        const rated: number[] = [];
         for (const gid of st.generals) {
             const g = this.generals.get(gid);
             if (g) {
-                sum += g.def[key] + (g.level - 1) * 0.5;
+                rated.push(g.def[key] + (g.level - 1) * 0.5);
             }
         }
+        rated.sort((a, b) => b - a);
+        const limit = Math.max(1, Balance.generalsPerCity);
+        let sum = 0;
+        for (let i = 0; i < Math.min(limit, rated.length); i++) {
+            sum += rated[i];
+        }
         return sum;
+    }
+
+    // ------------------------------------------------------------------
+    // 君主 / 忠诚度 / 俘虏
+    //
+    // 一条因果链，没有第二条：
+    //   攻破敌城 → 按公开概率生擒守将 → 俘虏营二选一（招降 / 放归）
+    //   → 招降失败：忠诚升，越劝越硬
+    //   → 放归：回原势力，忠诚降（被旧主猜忌），下次被俘就更好招
+    // 俘虏用 GeneralState.captiveOf 表达，不另存一份名单：
+    // 一个将领要么在城上，要么在营里，不会两边都算。
+    // ------------------------------------------------------------------
+
+    /** 势力君主（没有将领的势力返回 null，例如 194 剧本的陶谦 / 刘繇） */
+    public rulerOf(factionId: string): GeneralDef | null {
+        const st = this.rulerStateOf(factionId);
+        return st ? st.def : null;
+    }
+
+    /**
+     * 势力君主的运行时状态。
+     *
+     * 必须校验 `g.faction === factionId`：`RULER_OF` 是**开局**的静态映射，
+     * 君主被招降之后它还指着原势力。不校验的话，一个已经投靠我方的旧主
+     * 会继续被当成原势力的君主显示，看起来像「一朝两主」。
+     */
+    public rulerStateOf(factionId: string): GeneralState | null {
+        const g = this.generals.get(RULER_OF[factionId]);
+        if (!g || g.faction !== factionId) {
+            return null;
+        }
+        return g;
+    }
+
+    /**
+     * 是否仍是**在位君主**。
+     *
+     * 三个条件同时成立才算：本人是君主、本势力认的君主就是他、这个势力还有城。
+     *
+     * 「君主不可招降」的准确含义是「**在位**君主不可招降」：他还坐着江山，
+     * 不会屈居人下。一旦失去所有城池，他就只是个亡国的俘虏，从这一刻起
+     * 按普通将领的规则走 —— 忠诚掉下来就能招。招降成功后 faction 改成我方，
+     * RULER_OF 对不上他，也就自动不再是君主了（只是个带加成的客将）。
+     */
+    public isReigning(g: GeneralState): boolean {
+        return !!g.def.ruler
+            && RULER_OF[g.faction] === g.def.id
+            && this.provincesOf(g.faction).length > 0;
+    }
+
+    /** 将领当前驻扎的城；在营里或流落无城时返回 null */
+    public cityOfGeneral(gid: string): ProvinceState | null {
+        let found: ProvinceState | null = null;
+        this.provinces.forEach((p) => {
+            if (!found && p.generals.indexOf(gid) >= 0) {
+                found = p;
+            }
+        });
+        return found;
+    }
+
+    /**
+     * 该城的君主加成（0.2 = +20%）。同城有多位君主时**取最高，不叠加**。
+     *
+     * 只认带 bonus 的将领，也就是君主。玩家自己的君主和招降来的旧主都算：
+     * 谁驻在这座城，这座城就听谁的。不叠加是硬规则 —— 否则把几个招来的旧主
+     * 塞进一城就能堆出离谱战力，玩家会立刻发现「堆君主」是唯一最优解。
+     */
+    public rulerBonusAt(st: ProvinceState, key: RulerBonusKey): number {
+        let best = 0;
+        for (const gid of st.generals) {
+            const g = this.generals.get(gid);
+            if (!g || !g.def.bonus) {
+                continue;
+            }
+            const v = g.def.bonus[key] || 0;
+            if (v > best) {
+                best = v;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 我方招降加成：己方阵营里带 persuade 的君主取最高，不叠加。
+     *
+     * 只算已经归我方、且不在营里的 —— 还在营里说明没降，谈不上替我招人。
+     * AI 不经营俘虏，所以这条加成实际上只对玩家有意义，不做第二套 AI 判定。
+     */
+    public persuadeBonus(): number {
+        let best = 0;
+        this.generals.forEach((g) => {
+            if (g.faction !== this.playerFaction || g.captiveOf !== '' || !g.def.bonus) {
+                return;
+            }
+            const v = g.def.bonus.persuade || 0;
+            if (v > best) {
+                best = v;
+            }
+        });
+        return best;
+    }
+
+    /** 被某势力关押的将领列表 */
+    public prisonersOf(factionId: string): GeneralState[] {
+        const out: GeneralState[] = [];
+        this.generals.forEach((g) => {
+            if (g.captiveOf === factionId) {
+                out.push(g);
+            }
+        });
+        return out;
+    }
+
+    /**
+     * 招降成功率：(100 - 忠诚) / 100 + 我方君主招降加成，上限 100%。
+     *
+     * **在位君主恒为 0**：他还坐着江山，不会屈居人下。
+     * 失去所有城池之后他不再是君主，按忠诚正常算 —— 这就是
+     * 「君主失去所有土地以后可以招募」这条规则的落点，不另开一套判定。
+     * UI 把这个百分比原样显示出来，除忠诚与公开的君主加成外没有隐藏修正。
+     */
+    public persuadeChance(g: GeneralState): number {
+        if (this.isReigning(g)) {
+            return 0;
+        }
+        const raw = (Balance.loyaltyMax - g.loyalty) / Balance.loyaltyMax
+            + this.persuadeBonus();
+        return Math.max(0, Math.min(1, raw));
+    }
+
+    /** 招降一名我方俘虏：成功改旗易帜并安置，失败忠诚上升 */
+    public persuade(gid: string): { ok: boolean; chance: number; reason: string } {
+        const g = this.generals.get(gid);
+        if (!g || g.captiveOf !== this.playerFaction) {
+            return { ok: false, chance: 0, reason: '此人不是我方俘虏' };
+        }
+        if (this.isReigning(g)) {
+            return { ok: false, chance: 0, reason: '在位君主不可招降，先夺其城池' };
+        }
+        const chance = this.persuadeChance(g);
+        if (random() >= chance) {
+            g.loyalty = Math.min(Balance.loyaltyMax,
+                g.loyalty + Balance.persuadeFailLoyaltyGain);
+            this.pushLog(`招降 ${g.def.name} 失败，忠诚升至 ${g.loyalty}。`);
+            return {
+                ok: false,
+                chance,
+                reason: `${g.def.name} 不肯归降，忠诚升至 ${g.loyalty}`,
+            };
+        }
+        const home = this.assignGeneralTo(gid, this.playerFaction);
+        if (!home) {
+            return { ok: false, chance, reason: '我方已无城池可安置' };
+        }
+        // 招降成功就改旗易帜。君主也一样：faction 一改，RULER_OF 就对不上他，
+        // isReigning 变 false，他从「君主」变成「带加成的客将」——
+        // 这就是「亡国君主可以招募」的完整闭环，不需要额外的降级字段。
+        const wasRuler = !!g.def.ruler;
+        g.captiveOf = '';
+        g.faction = this.playerFaction;
+        g.loyalty = Balance.recruitLoyalty;
+        const who = wasRuler ? `旧主 ${g.def.name}` : g.def.name;
+        this.pushLog(`${who} 归降，进驻 ${home.name}（忠诚 ${g.loyalty}）。`);
+        return { ok: true, chance, reason: `${who} 归降，进驻 ${home.name}` };
+    }
+
+    /** 放归一名我方俘虏：回原势力并降忠诚，为下次招降铺路 */
+    public release(gid: string): { ok: boolean; reason: string; loyalty: number } {
+        const g = this.generals.get(gid);
+        if (!g || g.captiveOf !== this.playerFaction) {
+            return { ok: false, reason: '此人不是我方俘虏', loyalty: 0 };
+        }
+        const home = this.homeCityFor(g);
+        if (!home) {
+            return {
+                ok: false,
+                reason: '天下已定，无处可放；可以直接招降',
+                loyalty: g.loyalty,
+            };
+        }
+        // 在位君主是主不是臣，「被旧主猜忌」对他不成立，放归不降忠诚。
+        // 亡国君主已经不是君主了：回去也没江山可坐，按普通将领算，忠诚照降 ——
+        // 这是「灭国 → 生擒 → 放归 → 再擒 → 招降」这条链能闭合的关键一步。
+        const reigning = this.isReigning(g);
+        if (!reigning) {
+            g.loyalty = Math.max(Balance.loyaltyMin,
+                g.loyalty - Balance.releaseLoyaltyDrop);
+        }
+        g.captiveOf = '';
+        home.generals.push(gid);
+        this.pushLog(`放归 ${g.def.name} → ${home.name}`
+            + (reigning ? '（在位君主不降忠诚）。' : `，忠诚降至 ${g.loyalty}。`));
+        return {
+            ok: true,
+            reason: `${g.def.name} 已放归 ${home.name}，忠诚 ${g.loyalty}`,
+            loyalty: g.loyalty,
+        };
+    }
+
+    /** 放归去处：原势力人口最多的城；原势力已亡则流亡到中立 / 他势力城 */
+    private homeCityFor(g: GeneralState): ProvinceState | null {
+        const own = this.provincesOf(g.faction);
+        if (own.length > 0) {
+            return own.slice().sort((a, b) => b.pop - a.pop)[0];
+        }
+        // 亡国将领不能凭空消失：流亡到中立城（没有中立城就挑一座非我方城），
+        // 玩家日后打下那座城还能再抓他一次，「放归→再俘→更易招降」的链条不断。
+        // 中立城按现有驻将数升序挑最少的一座：别把所有流亡将都堆进同一座城，
+        // 否则单城守将越堆越多，配合防御等级叠成谁都打不动的硬骨头。
+        const all = Array.from(this.provinces.values());
+        const neutral = all.filter((p) => p.owner === NEUTRAL);
+        const pool = neutral.length > 0
+            ? neutral.slice().sort((a, b) => a.generals.length - b.generals.length)
+            : all.filter((p) => p.owner !== this.playerFaction)
+                .sort((a, b) => a.generals.length - b.generals.length);
+        return pool.length > 0 ? pool[0] : null;
+    }
+
+    /** 给刚归降的将领找一座我方城：驻将最少优先，其次人口最多 */
+    private assignGeneralTo(gid: string, factionId: string): ProvinceState | null {
+        const own = this.provincesOf(factionId);
+        if (own.length === 0) {
+            return null;
+        }
+        const home = own.slice().sort((a, b) =>
+            a.generals.length - b.generals.length || b.pop - a.pop)[0];
+        home.generals.push(gid);
+        return home;
+    }
+
+    /**
+     * 势力灭亡：该势力**所有**将领忠诚下降一次（在城的、在营的、流亡的都算）。
+     *
+     * 为什么要这一步：在位君主开局忠诚 100，招降成功率恒为 0。
+     * 不降忠诚，「失去所有土地之后可以招降」这条规则写了也等于没写。
+     * 国破则人心散 —— 君主掉到 70（成功率 30%），再放归一次掉到 45（55%），
+     * 整条链条才真正走得通。
+     *
+     * 已经就地归顺的守将 faction 已改成攻方，不会被误伤；中立城不算亡国。
+     */
+    private onFactionFallen(factionId: string): void {
+        const f = FACTION_MAP[factionId];
+        let n = 0;
+        this.generals.forEach((g) => {
+            if (g.faction === factionId) {
+                g.loyalty = Math.max(Balance.loyaltyMin,
+                    g.loyalty - Balance.fallenLoyaltyDrop);
+                n++;
+            }
+        });
+        if (n > 0) {
+            this.pushLog(`${f ? f.name : factionId} 亡国，麾下 ${n} 名将领忠诚下降 `
+                + `${Balance.fallenLoyaltyDrop}。`);
+        }
     }
 
     /** 是否为相邻省份（依据真实地理接壤关系） */
@@ -431,6 +725,9 @@ export class GameState {
         if (from.troops <= 0) {
             return { ok: false, reason: `${from.name}没有可用兵力，请先征兵` };
         }
+        if (from.attacked) {
+            return { ok: false, reason: `${from.name} 本回合已出征，等募兵或调兵后再战` };
+        }
         return { ok: true, reason: '可以进攻' };
     }
 
@@ -447,7 +744,10 @@ export class GameState {
     public recruit(st: ProvinceState, want: number): number {
         const gold = this.gold.get(st.owner) || 0;
         const cap = this.garrisonCap(st);
-        const room = Math.max(0, cap - st.troops);
+        // 征兵与调兵用同一条「临时集结」规则：可以超编到上限的 overCapFactor 倍。
+        // 不允许超编时，双方都满编，单城对单城恒为 1:1，谁也打不动 —— 而金币
+        // 已经堆到几十万却一个兵也征不出来，钱和兵同时失去意义。
+        const room = Math.max(0, cap * Balance.overCapFactor - st.troops);
         // 金币与人口双重限制
         const byGold = Math.floor(gold / Balance.goldPerTroop);
         const byPop = Math.floor((st.pop - 1) / Balance.popPerTroop);
@@ -462,7 +762,8 @@ export class GameState {
         // 这里迭代收敛到「扣完人口后仍不超新上限」的量，几次就稳定。
         for (let i = 0; i < 4 && amount > 0; i++) {
             const popAfter = Math.max(1, st.pop - amount * Balance.popPerTroop);
-            const overflow = st.troops + amount - this.capAt(st, popAfter);
+            const overflow = st.troops + amount
+                - this.capAt(st, popAfter) * Balance.overCapFactor;
             if (overflow <= 0) {
                 break;
             }
@@ -476,7 +777,7 @@ export class GameState {
         st.pop = Math.max(1, st.pop - amount * Balance.popPerTroop);
         this.gold.set(st.owner, gold - amount * Balance.goldPerTroop);
         // 兜底：理论上上面已经收敛，这里只防御浮点误差
-        const newCap = this.garrisonCap(st);
+        const newCap = this.garrisonCap(st) * Balance.overCapFactor;
         if (st.troops > newCap) {
             st.troops = newCap;
         }
@@ -680,27 +981,171 @@ export class GameState {
         return copy;
     }
 
-    /** 在本方相邻省份之间调兵 */
-    public moveTroops(from: ProvinceState, to: ProvinceState, troops: number): boolean {
+    /**
+     * 在本方相邻省份之间调兵
+     *
+     * @param moveGenerals 是否按调兵比例带走将领。玩家手动调兵要带（兵走了
+     *        将不能留守空城）；自动补给传 false —— 将领调动是玩家的决策，
+     *        补给线不该替玩家把守将也搬走。
+     */
+    public moveTroops(
+        from: ProvinceState,
+        to: ProvinceState,
+        troops: number,
+        moveGenerals = true,
+    ): boolean {
         if (from.owner !== to.owner || !this.isAdjacent(from, to) || troops <= 0) {
             return false;
         }
-        const room = Math.max(0, this.garrisonCap(to) - to.troops);
+        // 调兵可以「临时集结」：允许超过驻军上限，最多到上限的 overCapFactor 倍。
+        // 上限是硬顶时，总兵力再多也凑不出单点优势（兵按人口摊在每座城里），
+        // 地图上只要有一个瓶颈城，最后一座城就永远打不下来。
+        const room = Math.max(0, this.garrisonCap(to) * Balance.overCapFactor - to.troops);
         const amount = Math.min(troops, from.troops, room);
         if (amount <= 0) {
             return false;
         }
+        const before = from.troops;
         from.troops -= amount;
         to.troops += amount;
-        // 将领随军移动（简单规则：从该省抽调一半将领，至少保留 0 位）
-        const moveCount = Math.floor(from.generals.length / 2);
-        for (let i = 0; i < moveCount; i++) {
-            const gid = from.generals.shift();
-            if (gid) {
-                to.generals.push(gid);
+        if (moveGenerals) {
+            // 将领按「调走的兵力比例」随军。旧规则固定抽一半将领：
+            // 倾巢出动时兵全走了、将却留守空城，玩家会觉得被坑。
+            const moveCount = Math.floor(from.generals.length * (amount / Math.max(1, before)));
+            for (let i = 0; i < moveCount; i++) {
+                const gid = from.generals.shift();
+                if (gid) {
+                    to.generals.push(gid);
+                }
             }
         }
         return true;
+    }
+
+    /**
+     * 后方补给：把腹地的余兵自动送往一线，返回本回合搬动的兵力
+     *
+     * 每座「完全不接壤非我方城池」的城算后方：保留 rearGarrisonRatio 的守备兵，
+     * 其余送给「更靠近前线」的邻城；最多传 redeployPasses 跳，腹地的兵能一路
+     * 流到边境。前线城不往外送 —— 它自己就是战场。
+     *
+     * 这条规则解决的是「兵够却打不出去」：驻军上限由人口决定，兵只能待在
+     * 各自城里，城一多兵就散；手动调兵每次只能调一半，三跳之后只剩 12%。
+     * 现在兵会自己往需要的地方走，玩家不必当搬运工。
+     *
+     * 玩家与 AI 同规则，不做隐藏的不对称（AI 的兵也会集中，攻城更难）。
+     */
+    private autoRedeploy(): number {
+        let moved = 0;
+        for (let pass = 0; pass < Balance.redeployPasses; pass++) {
+            let movedThisPass = 0;
+            this.provinces.forEach((p) => {
+                // 前线城不外送：它自己就是战场，把兵送走等于自毁防线
+                if (this.attackTargets(p).length > 0) {
+                    return;
+                }
+                const keep = Math.round(this.garrisonCap(p) * Balance.rearGarrisonRatio);
+                const spare = p.troops - keep;
+                if (spare <= 0) {
+                    return;
+                }
+                // 挑一个「更靠前」的邻城：直接接壤敌军最好，其次是邻城里有接壤敌军的
+                let best: ProvinceState | null = null;
+                let bestScore = 0;
+                for (const id of p.borders) {
+                    const q = this.provinces.get(id);
+                    if (!q || q.owner !== p.owner) {
+                        continue;
+                    }
+                    const score = this.attackTargets(q).length > 0
+                        ? 2
+                        : (this.hasEnemyNeighbor(q) ? 1 : 0);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = q;
+                    }
+                }
+                // 邻城都不比它靠前：原地不动，避免后方城之间来回搬兵
+                if (!best || bestScore === 0) {
+                    return;
+                }
+                // 自动补给只填到上限，**不超编**：超编是要付流失代价的
+                // 临时集结，这个取舍必须由玩家自己决定，不能替他做主。
+                const room = Math.max(0, this.garrisonCap(best) - best.troops);
+                const send = Math.min(spare, room);
+                if (send <= 0) {
+                    return;
+                }
+                const before = best.troops;
+                if (this.moveTroops(p, best, send, false)) {
+                    movedThisPass += best.troops - before;
+                }
+            });
+            moved += movedThisPass;
+            if (movedThisPass === 0) {
+                break;
+            }
+        }
+        return moved;
+    }
+
+    /**
+    /** 组装一场战斗双方的战力参数（实战结算与战前预估共用同一套口径） */
+    private buildCombatSides(from: ProvinceState, to: ProvinceState)
+        : { atkSide: CombatSide; defSide: CombatSide } {
+        const atkSide: CombatSide = {
+            troops: from.troops,
+            atk: this.sumGeneralRating(from, 'atk'),
+            def: this.sumGeneralRating(from, 'def'),
+            cap: this.garrisonCap(from),
+            // 进攻方的君主加成只算 atk：孙策、吕布这类「亲冒矢石」的君主
+            mul: 1 + this.rulerBonusAt(from, 'atk'),
+        };
+        const defSide: CombatSide = {
+            troops: to.troops,
+            atk: this.sumGeneralRating(to, 'atk'),
+            def: this.sumGeneralRating(to, 'def'),
+            cap: this.garrisonCap(to),
+            // 防守方的君主加成只算 def：公孙度这类「据险自守」的君主
+            mul: 1 + this.rulerBonusAt(to, 'def'),
+        };
+        return { atkSide, defSide };
+    }
+
+    /**
+     * 战前胜算预估（纯计算，不掷随机、不改任何状态）
+     *
+     * 面板在玩家点「进攻」之前给出一个档位提示：兵力、守将、工事、君主加成
+     * 都算进两边战力，按战力比用 logistic 近似出一个 0~1 的胜率。它只是
+     * 决策参考，真实战斗仍有 randomSpread 浮动，不保证结果。
+     */
+    public previewAttack(from: ProvinceState, to: ProvinceState): {
+        ratio: number;
+        winRate: number;
+        label: string;
+    } {
+        const { atkSide, defSide } = this.buildCombatSides(from, to);
+        const atkMul = (1 + atkSide.atk * Balance.atkPerRating) * (atkSide.mul || 1);
+        const defMul = (1 + defSide.def * Balance.defPerRating) * (defSide.mul || 1)
+            * (1 + to.fort * Balance.fortPerPoint);
+        const atkPower = Math.max(1, atkSide.troops) * atkMul;
+        const defPower = Math.max(1, defSide.troops) * defMul;
+        const ratio = atkPower / defPower;
+        // 守城本就有优势：战力比 1.15 才算五五开（与 aiAttackRatio 同口径）
+        const x = ratio / Balance.aiAttackRatio;
+        const k = 1.5;
+        const winRate = Math.pow(x, k) / (Math.pow(x, k) + 1);
+        let label: string;
+        if (winRate >= 0.7) {
+            label = '胜算高';
+        } else if (winRate >= 0.5) {
+            label = '胜算偏优';
+        } else if (winRate >= 0.3) {
+            label = '胜算偏险';
+        } else {
+            label = '慎攻';
+        }
+        return { ratio, winRate, label };
     }
 
     /**
@@ -711,19 +1156,11 @@ export class GameState {
         captured: boolean;
         loot: number;
     } | null {
-        if (from.owner !== to.owner && this.isAdjacent(from, to) && from.troops > 0) {
-            const atkSide: CombatSide = {
-                troops: from.troops,
-                atk: this.sumGeneralRating(from, 'atk'),
-                def: this.sumGeneralRating(from, 'def'),
-                cap: this.garrisonCap(from),
-            };
-            const defSide: CombatSide = {
-                troops: to.troops,
-                atk: this.sumGeneralRating(to, 'atk'),
-                def: this.sumGeneralRating(to, 'def'),
-                cap: this.garrisonCap(to),
-            };
+        if (from.owner !== to.owner && this.isAdjacent(from, to)
+            && from.troops > 0 && !from.attacked) {
+            // 出征标记：一座城一回合只能打一次（见 ProvinceState.attacked）
+            from.attacked = true;
+            const { atkSide, defSide } = this.buildCombatSides(from, to);
             const result = resolveBattle({
                 atkSide,
                 defSide,
@@ -743,6 +1180,10 @@ export class GameState {
                 const prevOwner = to.owner;
                 this.gold.set(from.owner, (this.gold.get(from.owner) || 0) + loot);
                 to.owner = from.owner;
+                // 新占领的城本回合不能再出征：部队刚打完一仗要整编。
+                // 不设这一条，打下 A 就能立刻从 A 打 B，一回合连锁推七八座城，
+                // 攻城折损与补兵的节奏全被跳过（实测 11 回合统一天下）。
+                to.attacked = true;
                 to.pop = Math.max(1, to.pop * (1 - Balance.capturePopLoss));
                 // 兵燹之后百业凋敝：发展度受损，新城要靠「治理」重新养起来。
                 // 这也让「打下一座富城」不等于立刻拿到满额产出。
@@ -757,16 +1198,39 @@ export class GameState {
                 to.troops = Math.min(garrison, this.garrisonCap(to));
                 from.troops = Math.max(0, survivors - to.troops);
 
-                // 守将不会凭空消失：把他们撤到原势力最近的己方据点；
-                // 若该势力已无据点，则视为归降（留在原地）。
+                // 守将三条去路，一个将领只会走其中一条：
+                //   1) 被生擒 → captiveOf = 攻方，进俘虏营（不在任何城的 generals 里）；
+                //   2) 突围   → 撤回原势力最近的己方据点；
+                //   3) 原势力已亡且突围成功 → 就地归顺，明确改掉 faction。
+                // 只有玩家会经营俘虏：AI 没有招降界面，把将领关在看不见的
+                // 地方只会让 48 人从地图上凭空消失。这条不对称写进 README。
                 const defenders = to.generals.splice(0, to.generals.length);
                 const retreatTo = this.findRetreatProvince(to, prevOwner);
+                const captor = from.owner;
+                const mayCapture = captor === this.playerFaction;
                 for (const gid of defenders) {
-                    if (retreatTo) {
+                    const g = this.generals.get(gid);
+                    if (mayCapture && random() < Balance.captureGeneralChance) {
+                        if (g) {
+                            g.captiveOf = captor;
+                        }
+                        this.pushLog(`生擒 ${g ? g.def.name : gid}，押入俘虏营。`);
+                    } else if (retreatTo) {
                         retreatTo.generals.push(gid);
                     } else {
                         to.generals.push(gid);
+                        if (g) {
+                            g.faction = captor;
+                        }
                     }
+                }
+
+                // 亡国判定：最后一城丢了，这个势力就没了。
+                // 必须放在守将处理**之后**：循环里就地归顺的人 faction 已经改成
+                // 攻方，不该再被算作「亡国之臣」；被生擒的守将 faction 还没改，
+                // 正好该跟着一起降 —— 君主就是在这里从 100 掉到 70 的。
+                if (prevOwner !== NEUTRAL && this.provincesOf(prevOwner).length === 0) {
+                    this.onFactionFallen(prevOwner);
                 }
 
                 // 进攻方最多留下 3 名武将镇守新城
@@ -860,11 +1324,14 @@ export class GameState {
             this.pushLog(`内政结算：${parts.join('、')}。`);
         }
         const econ = this.runEconomy();
+        // 补给线排在 AI 行动之前：双方都用「补给后」的兵力打仗，保持对称。
+        const redeployed = this.autoRedeploy();
         const report = this.runAiPhase();
         // 报告统一填「本月实收」，不混进 AI 行动后的下月预测
         report.goldIncome = econ.goldIncome;
         report.foodIncome = econ.foodIncome;
         report.reinforced = econ.reinforced;
+        report.redeployed = redeployed;
         report.autoOrders = dom.auto;
         report.domesticOrders = dom.executed;
         this.advanceDate();
@@ -874,6 +1341,7 @@ export class GameState {
         // pendingDomestic 已在 settleDomestic() 里清空，这里不用再管。
         this.provinces.forEach((p) => {
             p.acted = false;
+            p.attacked = false;
             p.captured = false;
         });
 
@@ -922,6 +1390,7 @@ export class GameState {
             reinforced: 0,
             autoOrders: 0,
             domesticOrders: 0,
+            redeployed: 0,
             popTotal: this.totalPop(this.playerFaction),
             provinceCount: this.provincesOf(this.playerFaction).length,
             lostCities: mineBefore.filter((id) => !mineAfter[id]),
@@ -992,6 +1461,18 @@ export class GameState {
     private runEconomy(): { goldIncome: number; foodIncome: number; reinforced: number } {
         let goldIncome = 0;
         let foodIncome = 0;
+        // 超编损耗先结算：临时集结的兵补给线养不起，每回合流失一部分。
+        // 放在募兵之前，所以「超编 → 流失 → 再募兵」的顺序是稳定的，
+        // 不会出现「先补满再扣」导致数字来回跳。
+        this.provinces.forEach((p) => {
+            const cap = this.garrisonCap(p);
+            if (p.troops <= cap) {
+                return;
+            }
+            const over = p.troops - cap;
+            const loss = Math.round(over * Balance.overCapLossRate);
+            p.troops = Math.max(cap, p.troops - loss);
+        });
         this.provinces.forEach((p) => {
             const inc = this.provinceIncome(p);
             this.gold.set(p.owner, (this.gold.get(p.owner) || 0) + inc);
@@ -1005,21 +1486,50 @@ export class GameState {
             p.pop = Math.min(maxPop, p.pop + Balance.popGrowth);
         });
 
-        let reinforced = 0;
+        // 驻军粮饷：每名驻军每月吃粮。养重兵本身要有持续代价，否则太平年月
+        // 粮草只进不出、攒成废纸。缺粮时扣到 0 为止，不按缺粮溃散兵力
+        // （那会形成缺粮 → 掉兵 → 更守不住的死亡螺旋）。中立无主城不养常备军。
+        const upkeepBy: Record<string, number> = {};
         this.provinces.forEach((p) => {
+            if (p.owner === NEUTRAL) {
+                return;
+            }
+            upkeepBy[p.owner] = (upkeepBy[p.owner] || 0) + p.troops;
+        });
+        Object.keys(upkeepBy).forEach((fid) => {
+            const cost = Math.round(upkeepBy[fid] * Balance.foodPerTroopUpkeep);
+            const avail = this.food.get(fid) || 0;
+            this.food.set(fid, Math.max(0, avail - cost));
+        });
+
+        let reinforced = 0;
+        // 募兵按势力累计，总量受 reinforceTotalCap 约束：城多不等于兵多。
+        const usedBy: Record<string, number> = {};
+        this.provinces.forEach((p) => {
+            // 中立城是无主之地：不自动募兵，守军保持开局水平，
+            // 不会随时间被经济系统养满成硬骨头。
+            if (p.owner === NEUTRAL) {
+                return;
+            }
             const factor = p.owner === this.playerFaction ? 1 : Balance.aiSupplyFactor;
             const want = Math.round(this.autoReinforce(p) * factor);
             const room = Math.max(0, this.garrisonCap(p) - p.troops);
             if (want <= 0 || room <= 0) {
                 return;
             }
+            const used = usedBy[p.owner] || 0;
+            const capLeft = Math.max(0, Balance.reinforceTotalCap - used);
+            if (capLeft <= 0) {
+                return;
+            }
             const avail = this.food.get(p.owner) || 0;
             const byFood = Math.floor(avail / Balance.foodPerAutoTroop);
-            const amount = Math.max(0, Math.min(want, room, byFood));
+            const amount = Math.max(0, Math.min(want, room, byFood, capLeft));
             if (amount <= 0) {
                 return;
             }
             p.troops += amount;
+            usedBy[p.owner] = used + amount;
             this.food.set(p.owner, avail - amount * Balance.foodPerAutoTroop);
             if (p.owner === this.playerFaction) {
                 reinforced += amount;
@@ -1070,7 +1580,7 @@ export class GameState {
      * 导出存档数据
      *
      * 只保存「会变化」的运行时状态（归属、兵力、人口、工事、发展度、
-     * 已登记/已执行的内政、金币/粮草、武将等级与驻地），
+     * 已登记/已执行的内政、金币/粮草、武将等级/驻地/所属/忠诚/俘虏状态），
      * 省名/坐标/配色等静态配置由代码提供，
      * 不重复存储，这样存档小且不受改数值影响。
      */
@@ -1085,13 +1595,20 @@ export class GameState {
                 dev: Math.round(p.dev * 100) / 100,
                 pending: p.pendingDomestic,
                 acted: p.acted,
+                attacked: p.attacked,
                 generals: p.generals.slice(),
             };
         });
 
         const generals: Record<string, SavedGeneral> = {};
         this.generals.forEach((g, id) => {
-            generals[id] = { level: g.level, exp: g.exp };
+            generals[id] = {
+                level: g.level,
+                exp: g.exp,
+                faction: g.faction,
+                loyalty: g.loyalty,
+                captiveOf: g.captiveOf,
+            };
         });
 
         const gold: Record<string, number> = {};
@@ -1216,6 +1733,9 @@ export class GameState {
                 if (typeof sv.acted === 'boolean') {
                     st.acted = sv.acted;
                 }
+                if (typeof sv.attacked === 'boolean') {
+                    st.attacked = sv.attacked;
+                }
                 if (Array.isArray(sv.generals)) {
                     // 只保留仍然存在的武将，避免存档里的脏数据
                     st.generals = sv.generals.filter((gid) => this.generals.has(gid));
@@ -1223,7 +1743,9 @@ export class GameState {
             }
         }
 
-        // 武将等级
+        // 武将等级、当前所属、忠诚度与俘虏状态
+        // 旧档没有后三个字段：faction 沿用 def.faction，loyalty 沿用配置初值，
+        // captiveOf 保持 ''（自由身），所以老进度读进来不会有人凭空坐牢。
         if (data.generals) {
             for (const key of Object.keys(data.generals)) {
                 const g = this.generals.get(key);
@@ -1237,8 +1759,30 @@ export class GameState {
                 if (Number.isFinite(gv.exp)) {
                     g.exp = Math.max(0, gv.exp);
                 }
+                if (typeof gv.faction === 'string'
+                    && (FACTION_MAP[gv.faction] || gv.faction === NEUTRAL)) {
+                    g.faction = gv.faction;
+                }
+                if (Number.isFinite(gv.loyalty)) {
+                    g.loyalty = Math.max(Balance.loyaltyMin,
+                        Math.min(Balance.loyaltyMax, Math.round(gv.loyalty)));
+                }
+                if (typeof gv.captiveOf === 'string'
+                    && (gv.captiveOf === ''
+                        || FACTION_MAP[gv.captiveOf] || gv.captiveOf === NEUTRAL)) {
+                    g.captiveOf = gv.captiveOf;
+                }
             }
         }
+
+        // 俘虏不能同时挂在某座城的驻将列表里（旧档 / 脏数据兜底）。
+        // 守恒条件是「在城 + 在营 = 48」，两边都算就会多出来。
+        this.provinces.forEach((p) => {
+            p.generals = p.generals.filter((gid) => {
+                const g = this.generals.get(gid);
+                return !g || g.captiveOf === '';
+            });
+        });
 
         this.logs = [];
         return true;
@@ -1248,9 +1792,9 @@ export class GameState {
      * 存档格式版本号
      *
      * ⚠ 刻意保持 1：deserialize() 对版本号是**严格相等**校验，升版本会直接
-     * 拒绝所有旧存档。新增的 dev / pending / acted / food / policy 全部是
-     * 可选字段 + 默认值回退，老进度能原样读进来，所以这里不升版本，
-     * 也不用写迁移逻辑。
+     * 拒绝所有旧存档。新增的 dev / pending / acted / food / policy /
+     * faction / loyalty / captiveOf 全部是可选字段 + 默认值回退，
+     * 老进度能原样读进来，所以这里不升版本，也不用写迁移逻辑。
      */
     public static readonly SAVE_VERSION = 1;
 }
@@ -1267,13 +1811,18 @@ interface SavedProvince {
     pending?: DomesticOrder | 'none';
     /** 本回合内政是否已执行；可选，旧档默认 false */
     acted?: boolean;
+    /** 本回合是否已出征；可选，旧档默认 false */
+    attacked?: boolean;
     generals: string[];
 }
 
-/** 存档中的武将状态 */
+/** 存档中的武将状态；后三个字段可选，旧档缺失时按配置初值回退 */
 interface SavedGeneral {
     level: number;
     exp: number;
+    faction?: string;
+    loyalty?: number;
+    captiveOf?: string;
 }
 
 /** 存档数据结构 */

@@ -320,14 +320,17 @@ section('武将不会凭空消失');
     }
     let after = 0;
     gs.provinces.forEach((p) => { after += p.generals.length; });
+    // 被生擒的将领不在任何城上，而是关在俘虏营里（captiveOf）。
+    // 守恒口径随之改成「在城 + 在营」，少算一边就会误报武将凭空消失。
+    const jailed = gs.prisonersOf(gs.playerFaction).length;
     check(attacks > 0, `至少发生了一次进攻（${attacks} 次）`);
-    check(after === before,
-        `攻防后武将总数守恒（战前 ${before}，战后 ${after}）`);
-    // 所有武将都必须仍然挂在某个省份上
+    check(after + jailed === before,
+        `攻防后武将总数守恒（战前 ${before}，战后 在城 ${after} + 在营 ${jailed}）`);
+    // 所有武将要么在城上、要么在营里，不能两边都算、也不能两边都不算
     const placed = new Set<string>();
     gs.provinces.forEach((p) => p.generals.forEach((g: string) => placed.add(g)));
-    check(placed.size === gs.generals.size,
-        `所有武将都还有驻地（已安置 ${placed.size} / 共 ${gs.generals.size}）`);
+    check(placed.size + jailed === gs.generals.size,
+        `所有武将都有去处（在城 ${placed.size} + 在营 ${jailed} / 共 ${gs.generals.size}）`);
 }
 
 // ------------------------------------------------------------------

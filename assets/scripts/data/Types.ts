@@ -14,15 +14,57 @@ export interface FactionDef {
     playable: boolean;
 }
 
+/** 将领身份：武将 / 文官。两类都有忠诚度，不做隐藏的差别待遇 */
+export type GeneralRole = 'military' | 'civil';
+
+/**
+ * 君主加成：按历史定位给的一项特长，全部是公开的百分比。
+ *
+ * 作用范围只有两处，不搞第三处：
+ *   atk / def / gold / food → **该君主驻守的那座城**（人走了加成就跟着走）
+ *   persuade               → 全局，只要这位君主已在我方阵营（在城上，不是在营里）
+ * 同一座城里有多位带加成的君主时取最高值，不叠加 —— 否则把招来的旧主
+ * 和自己的君主塞进一城就能堆出离谱数字。
+ */
+export interface RulerBonus {
+    /** 称号，UI 与战报显示用，例如「唯才是举」 */
+    title: string;
+    /** 进攻战力加成（0.2 = +20%），该城发起进攻时生效 */
+    atk?: number;
+    /** 防御战力加成，该城被进攻时生效 */
+    def?: number;
+    /** 金币月收入加成，该城 */
+    gold?: number;
+    /** 粮草月产出加成，该城 */
+    food?: number;
+    /** 招降成功率加成（全局，已归我方阵营时生效） */
+    persuade?: number;
+}
+
+/** 君主加成里带数值的那几项（title 只是称号，不算数值项） */
+export type RulerBonusKey = 'atk' | 'def' | 'gold' | 'food' | 'persuade';
+
 /** 武将定义 */
 export interface GeneralDef {
     id: string;
     name: string;
+    /** 开局所属势力（静态配置，投诚后以 GeneralState.faction 为准） */
     faction: string;
     /** 攻击等级 1-10 */
     atk: number;
     /** 防御等级 1-10 */
     def: number;
+    /** 武将还是文官 */
+    role: GeneralRole;
+    /**
+     * 是否为本势力君主；每个势力最多一人。
+     * 在位君主不可招降；失去所有城池后即可招降（见 GameState.isReigning）。
+     */
+    ruler?: boolean;
+    /** 开局忠诚度 0~100，越高越难招降 */
+    loyalty: number;
+    /** 君主专属：按历史定位给的一项加成。非君主没有这个字段 */
+    bonus?: RulerBonus;
 }
 
 /** 省份静态定义 */
@@ -50,6 +92,15 @@ export interface GeneralState {
     def: GeneralDef;
     level: number;
     exp: number;
+    /**
+     * 当前所属势力。招降成功后从 def.faction 改成新主的势力；
+     * def.faction 只用于开局布阵，别再拿它判断「现在是谁的人」。
+     */
+    faction: string;
+    /** 当前忠诚度 0~100：越高越不肯降；放归会降，招降失败会升 */
+    loyalty: number;
+    /** 被哪个势力关押；'' = 自由身（在城驻守）。俘虏不在任何 province.generals 里 */
+    captiveOf: string;
 }
 
 /**
@@ -97,6 +148,17 @@ export class ProvinceState {
      * 因为那时指令还只是登记状态，没有执行。
      */
     acted = false;
+    /**
+     * 本回合是否已从这座城出征过。
+     *
+     * 一座城一回合只能打一次：战斗本身就要折损四成兵力，如果允许同一座城
+     * 反复出征，「打一波 → 补兵 → 再打」的节奏就不存在了 —— 玩家能在
+     * 一回合里连下数城，整局十来个回合就结束了。出征一次之后必须等募兵
+     * 或从后方调兵，推进才有节拍。
+     *
+     * 调兵不占这个标记：兵可以先调进来，再从这座城打出去。
+     */
+    attacked = false;
     /** 本回合是否刚被占领（避免连动） */
     captured = false;
 

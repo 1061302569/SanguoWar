@@ -89,10 +89,13 @@ gs4.deserialize(gs3.serialize());
 assert(gs4.isDefeat(), '读档后仍判定为灭亡');
 assert(gs4.provincesOf('cao').length === 0, '读档后曹操据点数为 0');
 
-// ---- 读档不改变武将总数 ----
+// ---- 读档不改变武将总数（在城 + 在营）----
 let placed = 0;
 gs4.provinces.forEach((p) => { placed += p.generals.length; });
-assert(placed === gs4.generals.size, `读档后武将全部有驻地（${placed}/${gs4.generals.size}）`);
+let jailed = 0;
+gs4.generals.forEach((g) => { if (g.captiveOf !== '') jailed++; });
+assert(placed + jailed === gs4.generals.size,
+    `读档后武将都有去处（在城 ${placed} + 在营 ${jailed} / ${gs4.generals.size}）`);
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : failures + ' 项失败'}`);
 process.exit(failures === 0 ? 0 : 1);
