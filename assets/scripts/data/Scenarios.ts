@@ -1,5 +1,6 @@
-import { INITIAL_OWNER } from './Provinces';
-import { INITIAL_GENERAL_POST } from './Generals';
+import { INITIAL_OWNER, PROVINCES } from './Provinces';
+import { INITIAL_GENERAL_POST, GENERALS, RULER_OF, BONUS_KIND } from './Generals';
+import { FACTION_MAP, NEUTRAL } from './Factions';
 
 /**
  * 剧本（开局配置）
@@ -195,4 +196,88 @@ export function playableFactions(sc: ScenarioDef): string[] {
         hasCity[sc.owners[pid]] = true;
     }
     return sc.playable.filter((fid) => !!hasCity[fid]);
+}
+
+/** 地图选势力时显示的势力简报（全部来自剧本静态配置，不依赖当前局面） */
+export interface FactionBrief {
+    id: string;
+    name: string;
+    /** 开局城池数 */
+    cities: number;
+    /** 该势力武将数（含君主） */
+    generals: number;
+    /** 君主名；没有将领的势力为空串 */
+    ruler: string;
+    /** 君威文案，如「攻+20%」；没有则空串 */
+    bonus: string;
+    /** 接壤的其它势力名（不含中立），按名字排序 */
+    neighbors: string[];
+}
+
+/**
+ * 势力简报：地图上点一座城之后，浮层要回答「我选的是谁、多大、挨着谁」。
+ *
+ * 为什么不用当前局面算：玩家可能在中途打开剧本面板预览，这时 `GameState`
+ * 还是上一局打乱后的版图，用它算出来的「城池数」是错的。这里一律读剧本的
+ * 开局配置，所以预览与真正开局看到的数字完全一致。
+ */
+export function factionBriefOf(sc: ScenarioDef, fid: string): FactionBrief {
+    const mine: Record<string, boolean> = {};
+    for (const pid of Object.keys(sc.owners)) {
+        if (sc.owners[pid] === fid) {
+            mine[pid] = true;
+        }
+    }
+    const nbSet: Record<string, boolean> = {};
+    for (const p of PROVINCES) {
+        if (!mine[p.id]) {
+            continue;
+        }
+        for (const nb of p.borders) {
+            const owner = sc.owners[nb];
+            // 中立与「自己」都不算接壤势力；同势力只记一次
+            if (owner && owner !== fid && owner !== NEUTRAL && !nbSet[owner]) {
+                nbSet[owner] = true;
+            }
+        }
+    }
+    const neighbors = Object.keys(nbSet)
+        .map((id) => (FACTION_MAP[id] ? FACTION_MAP[id].name : id))
+        .sort((a, b) => a.localeCompare(b, 'zh'));
+
+    const rid = RULER_OF[fid];
+    const ruler = rid ? GENERALS.find((g) => g.id === rid) : undefined;
+    let bonus = '';
+    if (ruler && ruler.bonus) {
+        const parts: string[] = [];
+        for (const k of BONUS_KIND) {
+            const v = ruler.bonus[k.key];
+            if (typeof v === 'number' && v > 0) {
+                parts.push(`${k.name}+${Math.round(v * 100)}%`);
+            }
+        }
+        bonus = parts.join(' ');
+    }
+
+    return {
+        id: fid,
+        name: FACTION_MAP[fid] ? FACTION_MAP[fid].name : fid,
+        cities: Object.keys(mine).length,
+        generals: GENERALS.filter((g) => g.faction === fid).length,
+        ruler: ruler ? ruler.name : '',
+        bonus,
+        neighbors,
+    };
+}
+
+/** 浮层正文：三行，分别回答「多大 / 谁当家和君威 / 挨着谁」 */
+export function factionBriefLines(b: FactionBrief): string[] {
+    const head = `${b.cities} 城 · ${b.generals} 将`;
+    const ruler = b.ruler
+        ? `君主 ${b.ruler}${b.bonus ? ` · ${b.bonus}` : ''}`
+        : '无君主（没有武将，守成更难）';
+    const nb = b.neighbors.length > 0
+        ? `接壤 ${b.neighbors.join('、')}`
+        : '四周无敌对势力（开局相对安稳）';
+    return [head, ruler, nb];
 }

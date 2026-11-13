@@ -205,6 +205,7 @@ tools/                          # 本地开发辅助（不参与游戏打包）
 ├─ sim-report.ts                # 战报要闻置顶 + 敌情预警：重要度接线 / 置顶 / 刷新 / 存档 / UI 守卫
 ├─ sim-onboarding.ts            # 首次体验闭环：引导推进 / 阶段目标 / 局外档案 / 本局战绩 / 结算分享
 ├─ sim-achievement.ts           # 次日留存：12 条成就判定 / 每日挑战固定种子 / 今日成绩 / 存档兼容
+├─ sim-faction-pick.ts          # 开局流程：地图选势力简报 / 预览按剧本着色 / 不画金环 / 点击拦截
 ├─ simulate-wechat-build.mjs    # 模拟构建产物并验证校验插件
 ├─ validate-wechat-build.mjs    # 检查构建配置是否合规
 ├─ validate-scene.mjs           # 场景结构静态校验
@@ -324,9 +325,16 @@ node --experimental-strip-types --no-warnings tools/.bundle.sim-onboarding.ts
 #     UI 与状态层接线 / README 公开）
 node tools/bundle-test.mjs tools/sim-achievement.ts
 node --experimental-strip-types --no-warnings tools/.bundle.sim-achievement.ts
+
+# 24) 开局流程（势力简报与 owners 逐一对得上 / 无君主·无邻居兜底 /
+#     局面打乱后简报数字不变 / 归属读 sc.owners 而非 p.owner /
+#     点城拦截在 canAttack 之前 / drawPreview 不画金环且恢复玩家势力 /
+#     「所有底图重绘仍带 playerFaction」守卫未被放宽）
+node tools/bundle-test.mjs tools/sim-faction-pick.ts
+node --experimental-strip-types --no-warnings tools/.bundle.sim-faction-pick.ts
 ```
 
-当前状态（**20 个 TS 脚本全部通过：18 个逐项打印的回归合计 808 项 ok 断言 0 失败，
+当前状态（**21 个 TS 脚本全部通过：19 个逐项打印的回归合计 863 项 ok 断言 0 失败，
 另有逻辑测试 102/102 与端到端长测 35/35；4 个 mjs 静态校验全通过、
 引擎 tsc 类型检查 0 错误**）：**逻辑测试 102/102 通过、剧本系统回归全部通过、
 回合刷新回归全部通过、路网回归全部通过（35 城 / 58 路、0 条越城直达，
@@ -351,6 +359,9 @@ AI 行为回归全部通过（**27/27**；面板与 AI 共用胜率曲线、国�
 次日留存回归全部通过（**87/87**；12 条成就逐条判定 / 解锁不重复且不改入参 /
 v1 旧档与脏数据兜底 / 60 天种子无碰撞 / 固定种子序列可复现 / 今日成绩破纪录与跨天重置 /
 daily 存档往返与脏值回退 / UI 与状态层接线）、
+开局流程回归全部通过（**55/55**；势力简报与 owners 逐一对得上 / 无君主与无邻居兜底 /
+局面打乱后简报数字不变 / 归属读 sc.owners / 点城拦截在 canAttack 之前 /
+drawPreview 不画金环且恢复玩家势力 / 底图重绘守卫未被放宽）、
 地图几何自检全部通过、模拟试玩全部通过（点击 / 拖动 / 缩放 / 交互链路）、
 提示系统验证通过、场景校验全部通过、微信构建配置校验全部通过、
 存档往返验证通过、演出一致性验证通过**。
@@ -1498,6 +1509,63 @@ P1 解决的是「第一次进来知道干什么、赢完有得晒」。P2 要�
 纯函数不改入参、v1 旧档与脏数据兜底、60 天种子无碰撞、固定种子序列可复现
 且值域覆盖、今日成绩破纪录 / 跨天重置 / 连续天数、存档往返与脏值回退、
 UI 与状态层接线、README 公开。
+
+## 八·十五、开局流程：选剧本 → 在地图上点城选势力
+
+原来的选势力是剧本面板里点 4 个文字按钮。问题不在「能不能选」，而在
+**选之前看不到**：玩家不知道曹操在北、孙策在东南、谁挨着谁、谁只有 3 城，
+只能凭名字猜。现在改成两步。
+
+### 流程
+
+1. 剧本面板里选剧本（卡片不变），势力按钮保留为**预选**；
+2. 点「选势力开局」→ 面板收起，回到地图；
+3. 地图上所有可执掌势力的城加金色靶环，点任意一座即选中该势力；
+4. 底部浮层显示「城池数 / 武将数 / 君主与君威 / 接壤势力」，
+   点「以 XX 开局」正式开局，点「返回剧本」退回面板。
+
+点不可执掌的城（中立或本剧本不可选的势力）会明确提示「XX 属 袁绍，
+本剧本不可执掌」，不静默无反应。面板里的势力按钮也不再只是改个名字 ——
+点一下就在信息区显示同一份简报，和地图浮层用的是同一个 `factionBriefOf()`。
+
+### 三个容易做错的地方
+
+**1. 预览版图必须按剧本配置着色。**
+玩家可能在中途打开剧本面板预览，这时 `GameState` 还是上一局打乱后的版图。
+直接拿它画，会把「曹操的地盘」染成袁绍色，选势力直接失去意义。
+所以预览列表只覆盖 `owner`（取 `sc.owners`），其它字段与原型保持不变：
+
+```ts
+const owner = sc.owners[p.id] || NEUTRAL;
+preview.push(Object.assign(
+    Object.create(Object.getPrototypeOf(p)) as ProvinceState, p, { owner },
+));
+```
+
+`{ ...p }` 不能用 —— `ProvinceState` 是 class，展开会丢掉原型方法。
+归属判断同理：点城时读 `sc.owners[p.id]`，不读 `p.owner`。
+
+**2. 预览不能给任何城画玩家金环，但也不能放宽既有守卫。**
+`tools/sim-faction-identity.ts` 有一条守卫要求「所有底图重绘都带
+`playerFaction`」，防的是正常游戏画面漏传、导致金环不跟着换势力走。
+选势力是唯一例外（玩家还没执掌任何势力）。做法是在渲染层加一个语义化方法
+`MapRenderer.drawPreview(provinces)`：内部以空玩家势力绘制、绘制后恢复
+`this.playerFaction`，路网也顺便按「无主视角」画成不可进攻的浅色。
+这样例外只存在于一处，Controller 里所有 `draw()` 仍然带 `playerFaction`，
+守卫一行都不用改。
+
+**3. 选势力阶段点城不能落进战斗 / 调兵逻辑。**
+`onPickHex()` 第一行就拦截 `mode === 'pickFaction'`，位置在 `canAttack()`
+之前。同时 `refreshHud()` 在该模式下不覆盖提示文案，否则一次 `refreshAll()`
+就会把「点城选势力」冲回「橙红路可进攻」。
+
+退出时只做 `refreshAll()` + `openScenarioMenu()`：**不清存档、不动当前局面**，
+玩家预览完点「返回剧本」还能继续打原来那一局。
+
+`tools/sim-faction-pick.ts` 把这些钉成断言：势力简报与 `owners` 逐一对得上、
+无君主 / 无邻居的兜底文案、局面打乱后简报数字不变、预览读配置而非 `p.owner`、
+拦截在 `canAttack` 之前、`drawPreview` 不画金环且恢复玩家势力、
+「所有底图重绘仍带 playerFaction」守卫未被放宽、README 公开。
 
 ## 九、后续可做（按优先级）
 

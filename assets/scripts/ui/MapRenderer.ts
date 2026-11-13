@@ -172,6 +172,25 @@ export class MapRenderer {
         this.territories = buildTerritories(cities, landPoly);
     }
 
+    /**
+     * 选势力预览：按传入的归属着色，且**不给任何城画玩家金环**。
+     *
+     * 为什么单独开一个方法，而不是让调用方写 `draw(list, '')`：
+     * `tools/sim-faction-identity.ts` 有一条守卫要求「所有底图重绘都带
+     * playerFaction」，那条守卫防的是正常游戏画面漏传、导致金环不跟着
+     * 换势力走。选势力是唯一的例外（玩家还没执掌任何势力），
+     * 把例外圈在这一处语义化方法里，守卫不必放宽。
+     *
+     * 路网也会按「无主视角」重画成不可进攻的浅色 —— 选势力阶段本来
+     * 就不该出现进攻箭头，这正好是想要的效果。
+     */
+    public drawPreview(provinces: ProvinceState[]): void {
+        const keep = this.playerFaction;
+        this.draw(provinces, '');
+        // 预览只影响这一次绘制：交互与后续重绘仍按真实玩家势力判断
+        this.playerFaction = keep;
+    }
+
     /** 绘制整张地图（含按当前归属重新着色的路网） */
     public draw(provinces: ProvinceState[], playerFaction: string = this.playerFaction): void {
         const g = this.g;

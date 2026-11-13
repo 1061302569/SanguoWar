@@ -15,10 +15,11 @@ import {
 import { Geo } from './core/Geo';
 import { MapCamera } from './core/MapCamera';
 import { GeneralState, ProvinceState, RulerBonus } from './data/Types';
-import { FACTION_MAP } from './data/Factions';
+import { FACTION_MAP, NEUTRAL } from './data/Factions';
 import { ROLE_NAME, BONUS_KIND } from './data/Generals';
 import {
     DEFAULT_SCENARIO_ID, SCENARIOS, ScenarioDef, getScenario, playableFactions,
+    factionBriefOf, factionBriefLines, FactionBrief,
 } from './data/Scenarios';
 import { MapRenderer } from './ui/MapRenderer';
 import { MapInput } from './ui/MapInput';
@@ -62,7 +63,7 @@ export class GameController extends Component {
     /** 当前选中的省份 */
     private selected: ProvinceState | null = null;
     /** 高亮模式 */
-    private mode: 'select' | 'move' | 'attack' = 'select';
+    private mode: 'select' | 'move' | 'attack' | 'pickFaction' = 'select';
 
     // ---- UI 引用 ----
     private topBar: Node = null!;
@@ -209,6 +210,14 @@ export class GameController extends Component {
     private static readonly ACHIEVE_PER_PAGE = 8;
     /** 剧本面板里的「今日挑战」摘要行 */
     private dailySummary: Label = null!;
+
+    // ---- 地图选势力（开局流程：选剧本 → 在图上点城选势力） ----
+    /** 底部浮层：显示当前选中势力的简报与「以此势力开局」 */
+    private factionPickPanel: Node = null!;
+    private factionPickTitle: Label = null!;
+    private factionPickBody: Label = null!;
+    private factionPickConfirm: Node = null!;
+    private factionPickConfirmLabel: Label = null!;
 
     onLoad(): void {
         // 随机源默认就是 Math.random；显式设一次，避免上一次每日挑战
@@ -382,6 +391,9 @@ export class GameController extends Component {
         this.lastTapId = null;
         this.lastTapTime = 0;
         this.mode = 'select';
+        if (this.factionPickPanel) {
+            this.factionPickPanel.active = false;
+        }
         this.hideMenu();
 
         // selected 指向的是上一局的 ProvinceState，必须先清空再刷新
@@ -486,7 +498,142 @@ export class GameController extends Component {
         // 四个弹窗共用同一层遮罩，必须互斥：不然从俘虏营切过来会两层叠在一起
         this.prisonPanel.active = false;
         this.achievePanel.active = false;
+        // 从「地图选势力」返回时，浮层也要收起来，否则会和剧本面板叠在一起
+        if (this.factionPickPanel) {
+            this.factionPickPanel.active = false;
+        }
         this.refreshScenarioMenu();
+    }
+
+    // ==================================================================
+    // 地图选势力
+    //
+    // 原来的流程是「剧本面板里点 4 个文字按钮」：玩家看不到势力在地图上的
+    // 位置、大小和邻居，只能凭名字猜「曹操和孙策谁更靠北」。
+    // 现在改成两步：面板里选剧本 → 收起面板回到地图，点任意一座属于可玩
+    // 势力的城。面板里的势力按钮保留为「预选」，进来时直接高亮那一家。
+    // ==================================================================
+
+    /** 进入地图选势力模式：收起面板，高亮所有可玩势力的城池 */
+    private enterFactionPick(): void {
+        const sc = getScenario(this.pickScenarioId);
+        const playable = playableFactions(sc);
+        if (playable.length === 0) {
+            this.toast('该剧本没有可执掌的势力');
+            return;
+        }
+        if (playable.indexOf(this.pickFactionId) < 0) {
+            this.pickFactionId = playable[0];
+        }
+
+        this.menuLayer.active = false;
+        this.mode = 'pickFaction';
+        this.selected = null;
+        this.panel.active = false;
+        this.factionPickPanel.active = true;
+        this.cancelBtn.active = false;
+        // 全图视角：选势力要看的是「谁在哪、谁挨着谁」，停在上一局的
+        // 局部视野里会看不到大部分候选势力。
+        this.mapInput.resetView();
+
+        // 地图切到「无主视角」：draw(list, '') 不给任何城画玩家金环。
+        // 否则上一局的金环还亮着，玩家会以为那家已经归自己了。
+        //
+        // ⚠ 版图必须按**剧本开局配置**重新着色，不能直接用当前 ProvinceState：
+        // 玩家可能在中途打开剧本面板，这时地图还是上一局打乱后的版图，
+        // 照着它画会把「曹操的地盘」染成袁绍色，选势力直接失去意义。
+        // 这里只覆盖 owner，其它字段与原型保持不变（{...p} 会丢 class 方法）。
+        const preview: ProvinceState[] = [];
+        this.state.provinces.forEach((p) => {
+            const owner = sc.owners[p.id] || NEUTRAL;
+            preview.push(Object.assign(
+                Object.create(Object.getPrototypeOf(p)) as ProvinceState,
+                p,
+                { owner },
+            ));
+        });
+        this.mapRenderer.drawPreview(preview);
+        const picks = preview.filter((p) => playable.indexOf(p.owner) >= 0);
+        // 可玩势力的城统一加金色靶环：一眼看出「哪些能选」，
+        // 不必逐城点开面板去确认归属。
+        this.mapRenderer.drawHighlights(picks, 'select');
+        this.mapRenderer.setRouteFocus(null, []);
+
+        this.hintLabel.string = `点地图上的城选择势力 · 金环城属于可执掌势力（${playable.length} 家）`;
+        this.refreshFactionPick();
+        this.audio.play('click');
+    }
+
+    /** 退出选势力模式，回到剧本面板（不动当前局面，也不清存档） */
+    private exitFactionPick(): void {
+        this.mode = 'select';
+        this.selected = null;
+        this.factionPickPanel.active = false;
+        this.mapRenderer.clearHighlights();
+        // refreshAll 会把地图恢复成「当前局的视角」（玩家金环回来）
+        this.refreshAll();
+        this.openScenarioMenu();
+        this.audio.play('click');
+    }
+
+    /** 地图上点了一座城：按归属切换候选势力 */
+    private pickFactionAt(p: ProvinceState): void {
+        const sc = getScenario(this.pickScenarioId);
+        const playable = playableFactions(sc);
+        // 归属看剧本配置，不看 p.owner：选势力阶段地图画的是开局版图，
+        // 而 p 是当前局面里的对象，两者的 owner 可能不是一回事。
+        const owner = sc.owners[p.id] || NEUTRAL;
+        if (playable.indexOf(owner) < 0) {
+            const f = FACTION_MAP[owner];
+            this.toast(`${p.name} 属 ${f ? f.name : '中立'}，本剧本不可执掌`);
+            return;
+        }
+        this.pickFactionId = owner;
+        // 只借选中光晕表达「点中了这座城」，不打开城池面板 ——
+        // 那个面板显示的是上一局的城，在选势力阶段出现只会误导。
+        this.selected = p;
+        this.mapInput.focusOn(p);
+        this.mapInput.reclampView();
+        this.refreshFactionPick();
+        this.audio.play('click');
+    }
+
+    /** 刷新浮层：势力名 / 城池数 / 武将 / 君主与君威 / 接壤 */
+    private refreshFactionPick(): void {
+        const sc = getScenario(this.pickScenarioId);
+        const brief: FactionBrief = factionBriefOf(sc, this.pickFactionId);
+        this.factionPickTitle.string = `执掌 ${brief.name} · ${sc.name}`;
+        const f = FACTION_MAP[brief.id];
+        if (f) {
+            // 标题染成势力色（提亮）：和地图上的版图颜色对上，
+            // 玩家不用读字也能确认自己点中的是哪一家。
+            const c = new Color();
+            Color.fromHEX(c, f.color);
+            this.factionPickTitle.color = new Color(
+                Math.min(255, c.r + 70),
+                Math.min(255, c.g + 70),
+                Math.min(255, c.b + 70),
+                255,
+            );
+        }
+        this.factionPickBody.string = factionBriefLines(brief)
+            .concat(['点地图上别的城可改选 · 金环城都能执掌'])
+            .join('\n');
+        this.factionPickConfirmLabel.string = `以 ${brief.name} 开局`;
+    }
+
+    /** 确认：用选中的剧本与势力开新局 */
+    private confirmFactionPick(): void {
+        const sc = getScenario(this.pickScenarioId);
+        if (playableFactions(sc).indexOf(this.pickFactionId) < 0) {
+            this.toast('这个势力在本剧本没有城池，换一家吧');
+            return;
+        }
+        this.mode = 'select';
+        this.factionPickPanel.active = false;
+        this.mapRenderer.clearHighlights();
+        this.audio.play('click');
+        this.startNewGame(this.pickScenarioId, this.pickFactionId);
     }
 
     private hideMenu(): void {
@@ -616,8 +763,14 @@ export class GameController extends Component {
         });
 
         const f = FACTION_MAP[this.pickFactionId];
+        // 点势力按钮之后要有即时反馈：原来只回一句「执掌 曹操」，玩家看不出
+        // 3 城和 9 城的差别。这里直接给「城池 / 武将 / 君主君威 / 接壤」，
+        // 和地图选势力浮层用的是同一份简报（factionBriefOf），两处不会打架。
+        const brief = factionBriefOf(sc, this.pickFactionId);
+        const lines = factionBriefLines(brief);
         this.menuInfo.string = `当前选择：${sc.era}　难度 ${sc.difficulty}　`
-            + `执掌 ${f ? f.name : this.pickFactionId}\n`
+            + `执掌 ${f ? f.name : this.pickFactionId} · ${lines[0]}\n`
+            + `${lines[1]}　${lines[2]}\n`
             + '开始新局会清空当前进度，此操作不可撤销。';
 
         // 今日挑战摘要：不必点进去就知道「今天打没打、最好几回合」，
@@ -1336,7 +1489,7 @@ export class GameController extends Component {
             card.on(Node.EventType.TOUCH_END, () => this.onPickScenarioAt(i), this);
         }
 
-        const fHint = makeLabel('FactionHint', '执掌势力', {
+        const fHint = makeLabel('FactionHint', '执掌势力（也可在图上点城改选）', {
             size: 18, color: new Color(230, 215, 180, 255), bold: true,
         }, sp);
         setPos(fHint.node, 0, -92);
@@ -1358,18 +1511,20 @@ export class GameController extends Component {
 
         this.menuInfo = makeLabel('MenuInfo', '', {
             size: 16, color: new Color(215, 200, 170, 255),
-            align: HorizontalTextAlignment.LEFT, width: 580, height: 66, lineHeight: 26,
+            align: HorizontalTextAlignment.LEFT, width: 580, height: 80, lineHeight: 26,
         }, sp);
         setPos(this.menuInfo.node, 0, -220);
 
         const startBtn = makeRectStroke('StartNewGameBtn', 220, 60,
             new Color(150, 60, 45, 255), new Color(230, 190, 110, 255), 3, sp);
         setPos(startBtn, -120, -296);
-        makeLabel('StartNewGameTxt', '开始新局', {
-            size: 25, color: new Color(255, 240, 210, 255), bold: true,
+        // 「开始新局」改成「选势力开局」：点了不是立刻开局，而是收起面板、
+        // 回到地图上点城选势力。玩家能看清势力在地图上的位置、大小与邻居，
+        // 而不是对着四个文字按钮猜「曹操和孙策谁更靠北」。
+        makeLabel('StartNewGameTxt', '选势力开局', {
+            size: 24, color: new Color(255, 240, 210, 255), bold: true,
         }, startBtn);
-        startBtn.on(Node.EventType.TOUCH_END,
-            () => this.startNewGame(this.pickScenarioId, this.pickFactionId), this);
+        startBtn.on(Node.EventType.TOUCH_END, () => this.enterFactionPick(), this);
 
         const backBtn = makeRectStroke('MenuBackBtn', 160, 60,
             new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, sp);
@@ -1684,6 +1839,49 @@ export class GameController extends Component {
 
         this.refreshAutoButton();
         this.refreshDomesticButtons();
+
+        // ---- 地图选势力的底部浮层 ----
+        // 与城池面板同尺寸、同位置：进入选势力模式时它顶替城池面板出现，
+        // 玩家不会觉得「换了套界面」。面板本身不拦截地图点击（只占底部一条），
+        // 上半张地图仍然可以自由点城。
+        const fp = makeRectStroke('FactionPick', 720, 300,
+            new Color(28, 24, 18, 248), new Color(190, 160, 100, 220), 2, root);
+        addWidget(fp, { hCenter: 0, bottom: 0 });
+        fp.active = false;
+        this.factionPickPanel = fp;
+
+        this.factionPickTitle = makeLabel('FactionPickTitle', '', {
+            size: 26, color: new Color(255, 230, 170, 255), bold: true,
+            align: HorizontalTextAlignment.LEFT, width: 660,
+        }, fp);
+        addWidget(this.factionPickTitle.node, { top: 10, left: 18 });
+
+        this.factionPickBody = makeLabel('FactionPickBody', '', {
+            size: 19, color: new Color(235, 230, 215, 255),
+            align: HorizontalTextAlignment.LEFT, width: 680, height: 110, lineHeight: 26,
+        }, fp);
+        addWidget(this.factionPickBody.node, { top: 48, left: 18 });
+        this.factionPickBody.verticalAlign = Label.VerticalAlign.TOP;
+        this.factionPickBody.overflow = Label.Overflow.CLAMP;
+        this.factionPickBody.enableWrapText = true;
+
+        this.factionPickConfirm = makeRectStroke('FactionPickConfirm', 320, 56,
+            new Color(150, 60, 45, 255), new Color(230, 190, 110, 255), 3, fp);
+        addWidget(this.factionPickConfirm, { left: 20, bottom: 18 });
+        this.factionPickConfirmLabel = makeLabel('FactionPickConfirmTxt', '以此势力开局', {
+            size: 24, color: new Color(255, 240, 210, 255), bold: true,
+        }, this.factionPickConfirm);
+        this.factionPickConfirm.on(
+            Node.EventType.TOUCH_END, () => this.confirmFactionPick(), this,
+        );
+
+        const pickBack = makeRectStroke('FactionPickBack', 160, 56,
+            new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, fp);
+        addWidget(pickBack, { right: 20, bottom: 18 });
+        makeLabel('FactionPickBackTxt', '返回剧本', {
+            size: 22, color: new Color(240, 225, 190, 255), bold: true,
+        }, pickBack);
+        pickBack.on(Node.EventType.TOUCH_END, () => this.exitFactionPick(), this);
     }
 
     /**
@@ -1750,6 +1948,15 @@ export class GameController extends Component {
     }
 
     private onPickHex(p: ProvinceState | null): void {
+        // 选势力模式：点任何城都只切换候选势力，不进战斗 / 调兵逻辑。
+        // 点空白也不取消 —— doDeselect() 会把提示刷回战斗文案。
+        if (this.mode === 'pickFaction') {
+            if (p) {
+                this.pickFactionAt(p);
+            }
+            return;
+        }
+
         if (!p) {
             this.doDeselect();
             return;
@@ -2711,18 +2918,24 @@ export class GameController extends Component {
 
         // 提示：选中被图谋的城时直接给对策；进攻 / 调兵模式的提示由
         // showAttackMenu / showMoveMenu 在本函数之后覆盖，优先级更高。
-        const sel = this.selected;
-        const selThreat = sel && threats.some((t) => t.id === sel.id);
-        if (selThreat) {
-            this.hintLabel.string = `! 敌军图谋 ${sel!.name}，可调兵回防`;
-        } else if (!sel) {
-            this.hintLabel.string = threats.length > 0
-                ? `! 有 ${threats.length} 处敌情，点城池查看并调兵回防`
-                : '橙红路可进攻 · 绿/浅色不能打 · 全图常显';
-        } else if (sel.owner === st.playerFaction) {
-            this.hintLabel.string = `已选 ${sel.name} · 内政四选一，结束回合执行`;
+        // 选势力模式的提示由 enterFactionPick() 自己写，这里不能覆盖，
+        // 否则读档 / 重绘一路过 refreshAll 就把「点城选势力」冲掉了。
+        if (this.mode === 'pickFaction') {
+            // 交给 enterFactionPick / pickFactionAt 维护
         } else {
-            this.hintLabel.string = `敌方 ${sel.name}：选择我方相邻城池发起进攻`;
+            const sel = this.selected;
+            const selThreat = sel && threats.some((t) => t.id === sel.id);
+            if (selThreat) {
+                this.hintLabel.string = `! 敌军图谋 ${sel!.name}，可调兵回防`;
+            } else if (!sel) {
+                this.hintLabel.string = threats.length > 0
+                    ? `! 有 ${threats.length} 处敌情，点城池查看并调兵回防`
+                    : '橙红路可进攻 · 绿/浅色不能打 · 全图常显';
+            } else if (sel.owner === st.playerFaction) {
+                this.hintLabel.string = `已选 ${sel.name} · 内政四选一，结束回合执行`;
+            } else {
+                this.hintLabel.string = `敌方 ${sel.name}：选择我方相邻城池发起进攻`;
+            }
         }
 
         // 战报：要闻（! 开头）置顶，普通日志补位。
