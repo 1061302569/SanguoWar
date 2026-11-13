@@ -10,6 +10,7 @@ import {
     FactionDef, GeneralDef, GeneralState, ProvinceState, DomesticOrderKey, RulerBonusKey,
 } from '../data/Types';
 import { resolveBattle, CombatSide, random } from './Combat';
+import { RunStats, emptyStats, sanitizeStats } from './Profile';
 
 /** 每回合产生的财政报告 */
 export interface TurnReport {
@@ -195,6 +196,16 @@ export class GameState {
     public threats: Map<string, string> = new Map();
 
     /**
+     * 本局战绩统计。
+     *
+     * 结算页要能给玩家一个「值得晒、值得再来一次」的数字，但只靠
+     * `turn` 和当前城数说不清这一局发生了什么。这里只记事实（攻占 /
+     * 丢城 / 招降 / 放归 / 最大版图），**不发任何奖励**，因此不改变
+     * 已经校准好的 18~21 回合节奏。随局面存档一起走，旧档缺失时回退。
+     */
+    public stats: RunStats = emptyStats();
+
+    /**
      * 每回合结算完成后的回调 —— UI 的**统一刷新入口**
      *
      * ⚠ AI 阶段会直接改写 ProvinceState.owner / troops，而地图版图颜色只在
@@ -267,6 +278,10 @@ export class GameState {
         }
         this.gold.set(NEUTRAL, 300);
         this.food.set(NEUTRAL, Balance.startFood);
+
+        // 开局城数是阶段目标的基准：换剧本 / 换势力都按本局起手推算，
+        // 不会出现「一开局目标就已达成」。
+        this.stats = emptyStats(this.provincesOf(this.playerFaction).length);
     }
 
     /**
@@ -606,6 +621,7 @@ export class GameState {
         g.captiveOf = '';
         g.faction = this.playerFaction;
         g.loyalty = Balance.recruitLoyalty;
+        this.stats.persuaded++;
         const who = wasRuler ? `旧主 ${g.def.name}` : g.def.name;
         this.pushLog(`${who} 归降，进驻 ${home.name}（忠诚 ${g.loyalty}）。`, 2);
         return { ok: true, chance, reason: `${who} 归降，进驻 ${home.name}` };
@@ -635,6 +651,7 @@ export class GameState {
         }
         g.captiveOf = '';
         home.generals.push(gid);
+        this.stats.released++;
         this.pushLog(`放归 ${g.def.name} → ${home.name}`
             + (reigning ? '（在位君主不降忠诚）。' : `，忠诚降至 ${g.loyalty}。`), 2);
         return {
@@ -1217,6 +1234,14 @@ export class GameState {
                 captured = true;
                 loot = Math.round(result.defenderLoss * Balance.lootPerLoss);
                 const prevOwner = to.owner;
+                // 战绩统计：只记玩家这一方的事实，AI 互殴不计入。
+                // 放在改 owner 之前取 prevOwner，AI 夺走玩家城才算一次「丢城」。
+                if (from.owner === this.playerFaction) {
+                    this.stats.captures++;
+                }
+                if (prevOwner === this.playerFaction) {
+                    this.stats.losses++;
+                }
                 this.gold.set(from.owner, (this.gold.get(from.owner) || 0) + loot);
                 to.owner = from.owner;
                 // 新占领的城本回合不能再出征：部队刚打完一仗要整编。
@@ -1292,6 +1317,12 @@ export class GameState {
                 this.pushLog(`${from.name} 进攻 ${to.name} 失利。`,
                     from.owner === this.playerFaction || to.owner === this.playerFaction ? 2 : 0);
                 this.growGeneralExp(from, false, defenderBefore);
+            }
+            // 每次战斗都刷一次最大版图：最后一击统一天下时，结算页要能
+            // 立刻读到满版图，而不是等下一次 endTurn()。
+            const mineNow = this.provincesOf(this.playerFaction).length;
+            if (mineNow > this.stats.maxCities) {
+                this.stats.maxCities = mineNow;
             }
             return { result, captured, loot };
         }
@@ -1447,6 +1478,11 @@ export class GameState {
         report.domesticOrders = dom.executed;
         this.advanceDate();
         this.turn++;
+        // AI 阶段可能夺城，回合末再刷一次最大版图（读档后也不会倒退）
+        const mineEnd = this.provincesOf(this.playerFaction).length;
+        if (mineEnd > this.stats.maxCities) {
+            this.stats.maxCities = mineEnd;
+        }
         this.playerTurnEnded = false;
         // 重置每省行动标记（acted = 内政已执行，下一回合可以再选一次）
         // pendingDomestic 已在 settleDomestic() 里清空，这里不用再管。
@@ -2046,6 +2082,8 @@ export class GameState {
             // 内政自动化属于玩家偏好：读档后不用重新设一遍
             autoDomestic: this.autoDomestic,
             lastOrder: this.lastOrder,
+            // 本局战绩：与局面同存亡，新开一局由 reset() 清零
+            stats: this.stats,
         };
     }
 
@@ -2195,6 +2233,16 @@ export class GameState {
             });
         });
 
+        // 本局战绩跟着局面走。旧档没有 stats 时按「剧本开局城数 + 当前城数」
+        // 重建，最多版图至少不会比读档瞬间更小；SAVE_VERSION 仍保持 1。
+        const opening = Object.keys(sc.owners)
+            .filter((id) => sc.owners[id] === this.playerFaction).length;
+        this.stats = sanitizeStats(
+            data.stats,
+            opening > 0 ? opening : this.stats.openingCities,
+            this.provincesOf(this.playerFaction).length,
+        );
+
         // 战报、重要度与敌情预警都是「上一回合的过程信息」，不在存档里；
         // 读档后不重建，避免旧局的「敌军图谋」挂到新局面城池上。
         this.logs = [];
@@ -2260,6 +2308,8 @@ export interface SaveData {
     lastOrder?: DomesticOrder;
     /** 上一版的「内政方针」字段；只用于读旧档，新档写 autoDomestic + lastOrder */
     policy?: DomesticPolicy;
+    /** 本局战绩；可选，旧存档缺失时按开局城数与当前城数重建 */
+    stats?: RunStats;
 }
 
 /** 全部势力列表（避免循环依赖，这里再导出一次） */

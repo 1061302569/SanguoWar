@@ -193,8 +193,60 @@ export function vibrateShort(): void {
     }
 }
 
+/**
+ * 当前分享文案。
+ *
+ * 以前 `setupShare()` 在 onLoad 里注册完就是一句静态标语，玩家打完一局
+ * 点右上角「···」转发出去的还是「从一城之地到天下一统」，没有任何可比较
+ * 的成绩，也就没有分享理由。现在把文案抽成模块变量：结算时只改变量，
+ * 已注册的转发回调每次都读最新值。
+ */
+let _shareTitle = '三国战棋：从一城之地到天下一统';
+
+/** 读取当前分享文案（非微信环境同样可用，供「复制战绩」降级展示） */
+export function currentShareText(): string {
+    return _shareTitle;
+}
+
+/** 更新分享文案，不重复注册转发回调；非微信环境只记下文案 */
+export function setShareText(title: string): void {
+    if (typeof title === 'string' && title.length > 0) {
+        _shareTitle = title.slice(0, 120);
+    }
+}
+
+/**
+ * 复制战绩文案。微信走剪贴板 API，浏览器走 navigator.clipboard；
+ * 两者都没有时返回 false，由 UI 直接把文案显示出来（绝不静默失败）。
+ */
+export function copyText(text: string): boolean {
+    if (!text) {
+        return false;
+    }
+    const w = getWx();
+    try {
+        if (w && typeof w.setClipboardData === 'function') {
+            w.setClipboardData({ data: text });
+            return true;
+        }
+        const nav: any = typeof navigator !== 'undefined' ? navigator : null;
+        if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+            // 异步 API：这里只负责触发，写入失败也不该影响玩法
+            const p = nav.clipboard.writeText(text);
+            if (p && typeof p.catch === 'function') {
+                p.catch(() => undefined);
+            }
+            return true;
+        }
+    } catch (e) {
+        return false;
+    }
+    return false;
+}
+
 /** 分享配置（右上角「转发」会用它） */
 export function setupShare(title: string, imageUrl?: string): void {
+    setShareText(title);
     const w = getWx();
     if (!w) {
         return;
@@ -208,7 +260,7 @@ export function setupShare(title: string, imageUrl?: string): void {
     }
     if (typeof w.onShareAppMessage === 'function') {
         w.onShareAppMessage(() => ({
-            title,
+            title: currentShareText(),
             imageUrl: imageUrl || '',
         }));
     }

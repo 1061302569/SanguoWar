@@ -4,6 +4,11 @@ import {
 } from 'cc';
 import { GameState, DomesticOrder, POLICY_NAME } from './core/GameState';
 import { Balance } from './core/Balance';
+import {
+    PROFILE_KEY, PlayerProfile, RunResult, defaultProfile, sanitizeProfile,
+    TUTORIAL_STEPS, OBJECTIVE_IDS, OBJECTIVE_NAMES, objectiveLevel, objectiveLines,
+    tutorialLine, gradeOf, shareTextOf, recordResult, profileLine,
+} from './core/Profile';
 import { Geo } from './core/Geo';
 import { MapCamera } from './core/MapCamera';
 import { GeneralState, ProvinceState, RulerBonus } from './data/Types';
@@ -19,13 +24,16 @@ import { BattleShowcase } from './ui/BattleShowcase';
 import { AudioPlayer } from './audio/AudioPlayer';
 import { makeNode, makeBox, makeRect, makeRectStroke, makeLabel, setPos, addWidget } from './ui/UIKit';
 import {
-    getTopInsetDesign, keepScreenOn, loadData, onHide, saveData, setupShare, vibrateShort,
+    copyText, currentShareText, getTopInsetDesign, isWeChat, keepScreenOn, loadData,
+    onHide, saveData, setShareText, setupShare, vibrateShort,
 } from './platform/WeChatAdapter';
 
 const { ccclass } = _decorator;
 
-/** 本地存档的存储键 */
+/** 本地存档的存储键（局面存档：新开一局会清掉） */
 const SAVE_KEY = 'sanguowar_save_v1';
+/** 开局默认分享标语；结算后由战绩文案覆盖 */
+const DEFAULT_SHARE = '三国战棋：从一城之地到天下一统';
 
 /** 省份上的旗帜/数字标签 */
 interface HexView {
@@ -175,11 +183,27 @@ export class GameController extends Component {
     /** 本局是否已弹过结算（避免每回合重复弹） */
     private gameOverShown = false;
 
+    // ---- 首次体验：局外档案 / 任务式引导 / 阶段目标 / 战绩分享 ----
+    /** 跨对局累计成绩，存独立 key，不随局面存档被清掉 */
+    private profile: PlayerProfile = defaultProfile();
+    /** 常驻目标条：引导期显示下一步，引导完成后显示阶段目标 */
+    private goalNode: Node = null!;
+    private goalLabel: Label = null!;
+    /** 已播报过的目标级别：丢城回退不重复播报 */
+    private goalShownLevel = -1;
+    /** 本局战绩是否已计入档案：结算面板可能被反复打开，只能记一次 */
+    private resultRecorded = false;
+
     onLoad(): void {
+        // ---- 局外档案：独立 key，开局就恢复，结算与引导都读它 ----
+        this.profile = sanitizeProfile(loadData(PROFILE_KEY));
+        setShareText(this.profile.lastResult || DEFAULT_SHARE);
+
         // ---- 小游戏平台初始化 ----
         if (sys.platform === sys.Platform.WECHAT_GAME) {
             keepScreenOn();
-            setupShare('三国战棋：从一城之地到天下一统');
+            // 转发回调读的是适配层里的当前文案，结算后会自动换成带回合数的战绩
+            setupShare(currentShareText());
             // 切到后台时自动存档，避免玩家丢进度
             onHide(() => this.saveGame());
         }
@@ -252,6 +276,10 @@ export class GameController extends Component {
             this.toast('每城一回合只能出征一次；后方余兵会自动补给到前线');
         }, 6000);
         this.pendingTimers.push(id3 as any);
+
+        // 三条定时 toast 只作补充说明：真正的主引导是左上角常驻目标条。
+        // 它不会弹遮罩、不拦截点击，玩家做完一步才推进下一步。
+        this.refreshGoalBar();
     }
 
     onDestroy(): void {
@@ -309,6 +337,8 @@ export class GameController extends Component {
 
         this.state.reset(sid, fid);
         this.gameOverShown = false;
+        this.resultRecorded = false;
+        this.goalShownLevel = -1;
         this.lastTapId = null;
         this.lastTapTime = 0;
         this.mode = 'select';
@@ -468,7 +498,14 @@ export class GameController extends Component {
             + '开始新局会清空当前进度，此操作不可撤销。';
     }
 
-    /** 统一天下 / 败亡结算 */
+    /**
+     * 统一天下 / 败亡结算
+     *
+     * 以前只有「剧本 / 执掌 / 用时 / 据点」四行和一句「再来一把」，
+     * 玩家赢完没有可比较的成绩，也没有理由把游戏发给别人。现在给出
+     * 本局事实、评价、累计档案与一句带回合数的挑战文案 —— 全部只是
+     * 展示与记录，不发任何金币 / 兵 / 粮。
+     */
     private showResult(win: boolean): void {
         this.menuLayer.active = true;
         this.scenarioPanel.active = false;
@@ -478,14 +515,42 @@ export class GameController extends Component {
         const sc = getScenario(this.state.scenarioId);
         const f = FACTION_MAP[this.state.playerFaction];
         const mine = this.state.provincesOf(this.state.playerFaction).length;
+        const total = this.state.provinces.size;
+        const s = this.state.stats;
+        const result: RunResult = {
+            win,
+            faction: f ? f.name : this.state.playerFaction,
+            scenario: sc.name,
+            turns: this.state.turn,
+            cities: mine,
+            total,
+            stats: s,
+        };
+        const share = shareTextOf(result);
+
+        // 结算面板会被反复打开（读档进来、剧本弹窗返回、继续看看后再看），
+        // 累计档案只能记一次，否则 plays / wins 会虚高。
+        if (!this.resultRecorded) {
+            this.profile = recordResult(this.profile, result);
+            this.saveProfile();
+            this.resultRecorded = true;
+        }
+        // 右上角「···」转发立刻带上本局成绩，而不再是开局那句静态标语
+        setShareText(share);
+
         this.resultTitle.string = win ? '天下一统' : '大势已去';
         this.resultBody.string = [
-            `剧本　${sc.name}（${sc.era}）`,
-            `执掌　${f ? f.name : this.state.playerFaction}`,
-            `用时　第 ${this.state.turn} 回合 · ${this.state.dateText()}`,
-            `据点　${mine} / ${this.state.provinces.size}`,
+            `剧本　${sc.name}（${sc.era}） · 执掌 ${f ? f.name : this.state.playerFaction}`,
+            `用时　第 ${this.state.turn} 回合 · ${this.state.dateText()}　评价 ${gradeOf(win, this.state.turn)}`,
+            `据点　${mine} / ${total}　最大版图 ${s.maxCities} 城`,
+            `战绩　攻占 ${s.captures} 城 · 丢城 ${s.losses} 次`,
+            `　　　收降 ${s.persuaded} 人 · 放归 ${s.released} 人`,
             '',
-            win ? '四海归一。换个剧本，或再来一把。' : '基业尽失。换个剧本，或再来一把。',
+            profileLine(this.profile),
+            '',
+            `分享语　${share}`,
+            win ? '四海归一 · 换个剧本，或挑战更快回合数。'
+                : '基业尽失 · 这局的最远版图已经记进档案。',
         ].join('\n');
     }
 
@@ -926,6 +991,22 @@ export class GameController extends Component {
         this.threatLabel.overflow = Label.Overflow.CLAMP;
         this.threatLabel.enableWrapText = true;
 
+        // ---- 任务式引导 / 阶段目标条 ----
+        // 竖屏 720x1280：身份牌(104) → 战报(156) → 敌情(302) → 目标(374)，
+        // 到 446 结束，离底部面板(980 起)还有整片地图，不遮挡任何操作。
+        // 常驻而非弹窗：新玩家任何时刻都知道「下一步做什么」，老玩家
+        // 则看到「立足 / 破局 / 问鼎」的进度，18~40 回合才赢也有阶段感。
+        this.goalNode = makeRectStroke('GoalBox', 340, 72,
+            new Color(30, 26, 18, 235), new Color(214, 180, 110, 230), 2, root);
+        addWidget(this.goalNode, { left: 16, top: 374 + this.topInset });
+        this.goalLabel = makeLabel('GoalTxt', '', {
+            size: 17, color: new Color(255, 236, 190, 255), bold: true,
+            align: HorizontalTextAlignment.LEFT, width: 326, height: 66, lineHeight: 24,
+        }, this.goalNode);
+        this.goalLabel.verticalAlign = Label.VerticalAlign.TOP;
+        this.goalLabel.overflow = Label.Overflow.CLAMP;
+        this.goalLabel.enableWrapText = true;
+
         // ---- 结束回合按钮 ----
         // 放在面板上方的右侧，与提示条同一带
         const btn = makeRectStroke('EndTurn', 150, 60, new Color(150, 60, 45, 255),
@@ -1140,7 +1221,9 @@ export class GameController extends Component {
         setPos(footer.node, 0, -366);
 
         // ---------------- 胜负结算 ----------------
-        const rp = makeRectStroke('ResultPanel', 600, 540,
+        // 面板加高是为了放下「本局战绩 + 评价 + 档案摘要 + 分享语」；
+        // 四个按钮改 2x2，新增「分享战绩」不挤掉任何原有入口。
+        const rp = makeRectStroke('ResultPanel', 660, 660,
             new Color(30, 25, 18, 252), new Color(210, 175, 105, 235), 3, mask);
         addWidget(rp, { hCenter: 0, vCenter: 0 });
         rp.active = false;
@@ -1149,33 +1232,46 @@ export class GameController extends Component {
         this.resultTitle = makeLabel('ResultTitle', '', {
             size: 38, color: new Color(255, 225, 145, 255), bold: true,
         }, rp);
-        setPos(this.resultTitle.node, 0, 208);
+        setPos(this.resultTitle.node, 0, 270);
 
         this.resultBody = makeLabel('ResultBody', '', {
-            size: 20, color: new Color(235, 225, 205, 255),
-            align: HorizontalTextAlignment.LEFT, width: 520, height: 180, lineHeight: 30,
+            size: 18, color: new Color(235, 225, 205, 255),
+            align: HorizontalTextAlignment.LEFT, width: 580, height: 320, lineHeight: 27,
         }, rp);
-        setPos(this.resultBody.node, 0, 75);
+        setPos(this.resultBody.node, 0, 100);
+        this.resultBody.verticalAlign = Label.VerticalAlign.TOP;
+        this.resultBody.overflow = Label.Overflow.CLAMP;
+        this.resultBody.enableWrapText = true;
 
-        const againBtn = makeRectStroke('ResultAgainBtn', 320, 56,
+        // 上排：再开一局 / 分享战绩
+        const againBtn = makeRectStroke('ResultAgainBtn', 300, 56,
             new Color(150, 60, 45, 255), new Color(230, 190, 110, 255), 3, rp);
-        setPos(againBtn, 0, -65);
+        setPos(againBtn, -160, -140);
         makeLabel('ResultAgainTxt', '再开一局', {
             size: 24, color: new Color(255, 240, 210, 255), bold: true,
         }, againBtn);
         againBtn.on(Node.EventType.TOUCH_END, () => this.startNewGame(), this);
 
-        const changeBtn = makeRectStroke('ResultChangeBtn', 320, 56,
+        const shareBtn = makeRectStroke('ResultShareBtn', 300, 56,
+            new Color(58, 92, 76, 255), new Color(150, 220, 170, 245), 2, rp);
+        setPos(shareBtn, 160, -140);
+        makeLabel('ResultShareTxt', '分享战绩', {
+            size: 24, color: new Color(220, 250, 225, 255), bold: true,
+        }, shareBtn);
+        shareBtn.on(Node.EventType.TOUCH_END, () => this.onShareResult(), this);
+
+        // 下排：换个剧本 / 继续看看
+        const changeBtn = makeRectStroke('ResultChangeBtn', 300, 56,
             new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, rp);
-        setPos(changeBtn, 0, -140);
+        setPos(changeBtn, -160, -220);
         makeLabel('ResultChangeTxt', '换个剧本', {
             size: 24, color: new Color(240, 225, 190, 255), bold: true,
         }, changeBtn);
         changeBtn.on(Node.EventType.TOUCH_END, () => this.openScenarioMenu(), this);
 
-        const stayBtn = makeRectStroke('ResultStayBtn', 320, 56,
+        const stayBtn = makeRectStroke('ResultStayBtn', 300, 56,
             new Color(50, 44, 34, 255), new Color(150, 125, 80, 220), 2, rp);
-        setPos(stayBtn, 0, -215);
+        setPos(stayBtn, 160, -220);
         makeLabel('ResultStayTxt', '继续看看', {
             size: 24, color: new Color(210, 200, 180, 255), bold: true,
         }, stayBtn);
@@ -1456,6 +1552,8 @@ export class GameController extends Component {
         this.lastTapId = p.id;
         this.lastTapTime = now;
 
+        // 引导 ①：玩家真的点了一座城才算完成，onLoad 里自动选中的不算
+        this.advanceTutorial(0);
         this.selectProvince(p);
     }
 
@@ -1873,6 +1971,10 @@ export class GameController extends Component {
 
         // 战斗结果即时提示（不依赖战报面板，玩家一眼能看到）
         if (res.captured) {
+            // 引导 ④：玩家自己打下一座城（AI 之间易主不算）
+            if (from.owner === this.state.playerFaction) {
+                this.advanceTutorial(3);
+            }
             const captureTip = newPrisoners.length > 0 ? ` · 俘${newPrisoners.length}人` : '';
             this.toast(`⚔ 攻占 ${to.name}！驻军 ${garrison}，缴获 ${res.loot} 金${captureTip}`);
         } else {
@@ -2014,6 +2116,10 @@ export class GameController extends Component {
                 ? `自动方针→${POLICY_NAME[order]} · ${p.name}已选，结束回合执行`
                 : `${p.name} · 已选${POLICY_NAME[order]}，结束回合执行`);
         }
+        // 引导 ②：真的登记了一道内政才算完成（点同一道取消不算）
+        if (verdict !== 'cleared') {
+            this.advanceTutorial(1);
+        }
         // 登记也是要存档的状态：中途退出，回来还看得到这回合选了什么
         this.saveGame();
         this.refreshAll();
@@ -2088,6 +2194,8 @@ export class GameController extends Component {
         // 以前漏了这一步：玩家自己进攻正常（doAttack 里显式 refreshAll），
         // 唯独对手回合打下的城，到了我方回合地图还是旧颜色。
         const report = this.state.endTurn();
+        // 引导 ③：月收、内政结算与 AI 动向都跑完，玩家看了一整个回合
+        this.advanceTutorial(2);
 
         // 回合更替音效
         this.showcase.playTurnChange();
@@ -2370,6 +2478,15 @@ export class GameController extends Component {
         this.logLabel.string = recent
             .map((x) => `${x.important ? '! ' : '  '}${x.text}`)
             .join('\n');
+
+        // 常驻目标条 + 阶段目标达成播报（丢城回退不重复播报）
+        this.noteObjective(mine, st.provinces.size, st.stats.openingCities);
+        this.refreshGoalBar();
+        // 引导 ⑤：战报窗口里真的出现了 ! 要闻，就算玩家「看到了」
+        if (this.profile.tutorialStep === TUTORIAL_STEPS.length - 1
+            && recent.some((x) => x.important)) {
+            this.advanceTutorial(TUTORIAL_STEPS.length - 1);
+        }
     }
 
     update(dt: number): void {
@@ -2378,5 +2495,87 @@ export class GameController extends Component {
         if (this.selected) {
             this.mapRenderer.drawGlow([this.selected], this.timeAcc);
         }
+    }
+
+    // ==================================================================
+    // 首次体验：局外档案 / 任务式引导 / 阶段目标 / 战绩分享
+    //
+    // 这一组只做「让玩家知道下一步做什么、赢完之后有理由再来一局」。
+    // 不发金币 / 兵 / 粮，不碰 Balance.ts，不弹模态遮罩，也不拦截点击。
+    // ==================================================================
+
+    /** 局外档案独立存档：局面存档会在新开一局时被清掉，累计成绩不能跟着没 */
+    private saveProfile(): void {
+        saveData(PROFILE_KEY, this.profile);
+    }
+
+    /**
+     * 推进任务式引导：只有玩家真的做完当前这一步才 +1。
+     * 每个动作只接一根线，重复点 / 跳着做都不会把进度推乱。
+     */
+    private advanceTutorial(step: number): void {
+        if (this.profile.tutorialStep !== step || step < 0
+            || step >= TUTORIAL_STEPS.length) {
+            return;
+        }
+        const done = TUTORIAL_STEPS[step];
+        this.profile.tutorialStep = step + 1;
+        this.saveProfile();
+        this.toast(done.done);
+        this.refreshGoalBar();
+    }
+
+    /** 阶段目标达成播报一次；丢城回退后重新达成也给一次，但不刷屏 */
+    private noteObjective(mine: number, total: number, opening: number): void {
+        const lv = objectiveLevel(mine, total, opening);
+        if (this.goalShownLevel < 0) {
+            // 第一次刷新（开局 / 读档）只建立基线，不弹「已达成」
+            this.goalShownLevel = lv;
+            return;
+        }
+        if (lv > this.goalShownLevel) {
+            const name = OBJECTIVE_NAMES[Math.min(lv - 1, OBJECTIVE_NAMES.length - 1)];
+            this.toast(`达成目标 · ${name}！`);
+            for (let i = 0; i < lv; i++) {
+                const id = OBJECTIVE_IDS[i];
+                if (id && this.profile.objectives.indexOf(id) < 0) {
+                    this.profile.objectives.push(id);
+                }
+            }
+            this.saveProfile();
+        }
+        this.goalShownLevel = lv;
+    }
+
+    /** 常驻目标条：引导期显示「下一步做什么」，引导完成后显示阶段目标 */
+    private refreshGoalBar(): void {
+        if (!this.goalNode || !this.goalLabel) {
+            return;
+        }
+        const st = this.state;
+        const line = tutorialLine(this.profile.tutorialStep);
+        if (line) {
+            this.goalLabel.string = `${line}\n完成后解锁阶段目标`;
+        } else {
+            const mine = st.provincesOf(st.playerFaction).length;
+            this.goalLabel.string = objectiveLines(
+                mine, st.provinces.size, st.stats.openingCities, this.profile,
+            ).join('\n');
+        }
+    }
+
+    /**
+     * 分享战绩：微信里右上角「···」转发会自动带上最新文案（见 setupShare），
+     * 这里再把文案复制一份；H5 / 编辑器没有剪贴板时降级为一句可读提示。
+     */
+    private onShareResult(): void {
+        const text = currentShareText();
+        setShareText(text);
+        const copied = copyText(text);
+        const tip = isWeChat()
+            ? '战绩文案已备好 · 点右上角「···」转发给好友'
+            : (copied ? '战绩文案已复制，粘贴给好友吧' : '战绩文案见结算页 · 可长按记录');
+        this.toast(tip);
+        this.audio.play('click');
     }
 }

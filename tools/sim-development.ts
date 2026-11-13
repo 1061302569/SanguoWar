@@ -336,19 +336,31 @@ console.log('\n== 7. AI 也会经营 ==');
     const devBefore = aiCity.dev;
     const ownerBefore = aiCity.owner;
     const logsBefore = g.logs.length;
+    // AI 会主动攻城，而且可能「先被 A 攻占、再被 B 夺回」，owner 绕一圈回到
+    // 原主，但发展度已经按 captureDevLoss 掉过两次。只看 owner 会误判成
+    // 「治理把发展度刷低了」，所以这里直接记录本段所有被攻占过的城。
+    const capturedIds = new Set<string>();
+    const origAttack = g.attack.bind(g);
+    g.attack = (from, to) => {
+        const res = origAttack(from, to);
+        if (res && res.captured) {
+            capturedIds.add(to.id);
+        }
+        return res;
+    };
     for (let i = 0; i < 6; i++) {
         g.endTurn();
     }
     const after = g.provinces.get(aiCity.id)!;
-    if (after.owner === ownerBefore) {
-        check(after.dev >= devBefore,
-            `AI 城 ${after.name} 发展度没有倒退（${devBefore}→${after.dev}）`);
+    if (after.dev < devBefore) {
+        // 发展度只会在攻占时下降（治理 / 屯田 / 筑城都只会让它变高）。
+        // 因此「下降了」必须能对应到一次真实攻占，否则就是数值链路出错。
+        check(capturedIds.has(after.id) && after.dev >= Balance.devMin,
+            `AI 城 ${after.name} 发展度 ${devBefore}→${after.dev} 可追溯到攻占战损`
+            + `（${ownerBefore}→${after.owner}），不是治理刷低`);
     } else {
-        // AI 现在会主动攻城：城池易主时 captureDevLoss 让发展度下降是正常的
-        // 战损机制，不是「治理把发展度刷低了」。这时只校验数值仍合法。
-        check(after.dev >= Balance.devMin && after.dev <= Balance.devMax,
-            `AI 城 ${after.name} 易主（${ownerBefore}→${after.owner}），`
-            + `发展度 ${devBefore}→${after.dev} 属攻占损失，数值仍合法`);
+        check(true,
+            `AI 城 ${after.name} 发展度没有倒退（${devBefore}→${after.dev}）`);
     }
     // AI 治理必须传 log=false，否则十几个势力每回合刷满玩家战报
     const aiGovernLogs = g.logs.slice(logsBefore)

@@ -285,6 +285,15 @@ draw_text_at(tb[0] + 8, tb[3] - 34, '点选该城，用「调兵」把后方兵�
 draw_text_at(tb[0] + 8, tb[3] - 54, '敌情预警（每回合 AI 阶段刷新）', font_tiny,
              (236, 138, 92, 255), 'lm')
 
+# 任务式引导 / 阶段目标条：top=374，与 GameController 的 GoalBox 一致。
+# 引导期第一行是「下一步做什么」，引导完成后换成「目标 · 立足 3/5 城」。
+gb = widget_box(340, 72, left=16, top=374)
+draw_rect(gb, (30, 26, 18, 235), (214, 180, 110, 230))
+draw_text_at(gb[0] + 8, gb[3] - 16, '目标 · 立足　3/5 城', font_log,
+             (255, 236, 190, 255), 'lm')
+draw_text_at(gb[0] + 8, gb[3] - 42, '占据 5 座城池，站稳脚跟', font_log,
+             (225, 210, 175, 235), 'lm')
+
 # 省份面板：底部抽屉 720x300
 pb = widget_box(720, 300, hcenter=0, bottom=0)
 draw_rect(pb, (28, 24, 18, 248), (190, 160, 100, 220))
