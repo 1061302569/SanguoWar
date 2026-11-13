@@ -171,8 +171,28 @@ export class GameState {
         return this.autoDomestic ? this.lastOrder : 'none';
     }
 
-    /** 本回合战报 */
+    /** 全部战报（上限 200 条，不进存档） */
     public logs: string[] = [];
+    /**
+     * 与 logs 一一对应的重要度：2 = 要闻（直接涉及玩家的战况、AI 对玩家的意图）
+     * 1 = 玩家自己的内政 / 结算，0 = 其他势力之间的动态。
+     *
+     * AI 增强后一回合能写十几条战报，而战报窗口只有几行；只显示「最后 N 条」
+     * 时，玩家丢城、被夹击、对手集结图谋这类关键信息会被 AI 互殴日志冲掉
+     * （试玩探针里 42%~59% 的玩家要闻被挤出窗口）。分级后由 recentLogs()
+     * 把要闻钉在窗口顶部，普通日志只补空位。
+     */
+    private logPriority: number[] = [];
+
+    /**
+     * 敌情预警：上一回合 AI 阶段「自后方集结、图谋我方哪座城」。
+     * key = 我方城池 id，value = 集结方与兵力描述。
+     *
+     * AI 会主动集结是这次增强的核心，但如果玩家只能在战报里瞥一眼「图谋 XX」，
+     * 下回合照样不知道该往哪调兵。把它留到玩家回合，面板和提示条都能看见，
+     * 「AI 有意图」才变成「玩家有对策」。每回合 AI 阶段前清空，不进存档。
+     */
+    public threats: Map<string, string> = new Map();
 
     /**
      * 每回合结算完成后的回调 —— UI 的**统一刷新入口**
@@ -212,6 +232,8 @@ export class GameState {
         this.month = sc.month;
         this.playerTurnEnded = false;
         this.logs = [];
+        this.logPriority = [];
+        this.threats.clear();
 
         for (const def of PROVINCES) {
             const owner = sc.owners[def.id] || NEUTRAL;
@@ -566,7 +588,7 @@ export class GameState {
         if (random() >= chance) {
             g.loyalty = Math.min(Balance.loyaltyMax,
                 g.loyalty + Balance.persuadeFailLoyaltyGain);
-            this.pushLog(`招降 ${g.def.name} 失败，忠诚升至 ${g.loyalty}。`);
+            this.pushLog(`招降 ${g.def.name} 失败，忠诚升至 ${g.loyalty}。`, 2);
             return {
                 ok: false,
                 chance,
@@ -585,7 +607,7 @@ export class GameState {
         g.faction = this.playerFaction;
         g.loyalty = Balance.recruitLoyalty;
         const who = wasRuler ? `旧主 ${g.def.name}` : g.def.name;
-        this.pushLog(`${who} 归降，进驻 ${home.name}（忠诚 ${g.loyalty}）。`);
+        this.pushLog(`${who} 归降，进驻 ${home.name}（忠诚 ${g.loyalty}）。`, 2);
         return { ok: true, chance, reason: `${who} 归降，进驻 ${home.name}` };
     }
 
@@ -614,7 +636,7 @@ export class GameState {
         g.captiveOf = '';
         home.generals.push(gid);
         this.pushLog(`放归 ${g.def.name} → ${home.name}`
-            + (reigning ? '（在位君主不降忠诚）。' : `，忠诚降至 ${g.loyalty}。`));
+            + (reigning ? '（在位君主不降忠诚）。' : `，忠诚降至 ${g.loyalty}。`), 2);
         return {
             ok: true,
             reason: `${g.def.name} 已放归 ${home.name}，忠诚 ${g.loyalty}`,
@@ -675,7 +697,7 @@ export class GameState {
         });
         if (n > 0) {
             this.pushLog(`${f ? f.name : factionId} 亡国，麾下 ${n} 名将领忠诚下降 `
-                + `${Balance.fallenLoyaltyDrop}。`);
+                + `${Balance.fallenLoyaltyDrop}。`, 1);
         }
     }
 
@@ -823,7 +845,8 @@ export class GameState {
             const gain = st.dev - before;
             if (log) {
                 this.pushLog(`${st.name} 治理：发展度 +${gain}（${before}→${st.dev}），`
-                    + `耗 ${Balance.governGoldCost} 金，此后月收更高。`);
+                    + `耗 ${Balance.governGoldCost} 金，此后月收更高。`,
+                st.owner === this.playerFaction ? 1 : 0);
             }
             st.acted = true;
             return { ok: true, reason: `治理完成，发展度 +${gain}`, amount: gain };
@@ -834,7 +857,8 @@ export class GameState {
             const gain = Math.round(st.pop * Balance.farmFoodPerPop * this.devFactor(st));
             this.food.set(fid, food + gain);
             if (log) {
-                this.pushLog(`${st.name} 屯田：粮草 +${gain}（可供月募兵）。`);
+                this.pushLog(`${st.name} 屯田：粮草 +${gain}（可供月募兵）。`,
+                    st.owner === this.playerFaction ? 1 : 0);
             }
             st.acted = true;
             return { ok: true, reason: `屯田完成，粮草 +${gain}`, amount: gain };
@@ -852,7 +876,8 @@ export class GameState {
             this.food.set(fid, food - Balance.fortifyFoodCost);
             st.fort += Balance.fortifyFortGain;
             if (log) {
-                this.pushLog(`${st.name} 筑城：工事升至 ${st.fort}，守城更强。`);
+                this.pushLog(`${st.name} 筑城：工事升至 ${st.fort}，守城更强。`,
+                    st.owner === this.playerFaction ? 1 : 0);
             }
             st.acted = true;
             return { ok: true, reason: `筑城完成，工事 ${st.fort}`, amount: Balance.fortifyFortGain };
@@ -876,7 +901,8 @@ export class GameState {
                 return { ok: false, reason: `${st.name} 无法征兵（人口不足或已满员）`, amount: 0 };
             }
             if (log) {
-                this.pushLog(`${st.name} 征兵 ${got}。`);
+                this.pushLog(`${st.name} 征兵 ${got}。`,
+                    st.owner === this.playerFaction ? 1 : 0);
             }
             st.acted = true;
             return { ok: true, reason: `征兵 ${got}`, amount: got };
@@ -1227,7 +1253,7 @@ export class GameState {
                         if (g) {
                             g.captiveOf = captor;
                         }
-                        this.pushLog(`生擒 ${g ? g.def.name : gid}，押入俘虏营。`);
+                        this.pushLog(`生擒 ${g ? g.def.name : gid}，押入俘虏营。`, 2);
                     } else if (retreatTo) {
                         retreatTo.generals.push(gid);
                     } else {
@@ -1255,11 +1281,16 @@ export class GameState {
                     }
                 }
                 to.captured = true;
+                // 只要有一方是玩家，就是玩家必须看见的要闻；AI 之间互殴只作背景。
+                const importance = from.owner === this.playerFaction
+                    || prevOwner === this.playerFaction ? 2 : 0;
                 this.pushLog(`${from.name} 攻占 ${to.name}（原属 ${prevOwner}），`
-                    + `驻军 ${to.troops}，掠夺金币 ${loot}，发展度降至 ${to.dev}。`);
+                    + `驻军 ${to.troops}，掠夺金币 ${loot}，发展度降至 ${to.dev}。`,
+                importance);
                 this.growGeneralExp(from, true, defenderBefore);
             } else {
-                this.pushLog(`${from.name} 进攻 ${to.name} 失利。`);
+                this.pushLog(`${from.name} 进攻 ${to.name} 失利。`,
+                    from.owner === this.playerFaction || to.owner === this.playerFaction ? 2 : 0);
                 this.growGeneralExp(from, false, defenderBefore);
             }
             return { result, captured, loot };
@@ -1298,17 +1329,84 @@ export class GameState {
             while (g.exp >= need && g.level < 10) {
                 g.exp -= need;
                 g.level++;
-                this.pushLog(`武将 ${g.def.name} 晋升至 ${g.level} 级。`);
+                this.pushLog(`武将 ${g.def.name} 晋升至 ${g.level} 级。`, 1);
             }
         }
     }
 
-    /** 追加战报 */
-    public pushLog(msg: string): void {
+    /**
+     * 追加战报。
+     * @param priority 2 = 要闻（钉在战报窗口顶部），1 = 玩家内政 / 结算，0 = 其余
+     */
+    public pushLog(msg: string, priority = 0): void {
         this.logs.push(msg);
+        this.logPriority.push(priority);
         if (this.logs.length > 200) {
             this.logs.shift();
+            this.logPriority.shift();
         }
+    }
+
+    /**
+     * 取战报窗口要显示的内容：**要闻置顶，普通日志补位**。
+     *
+     * 要闻按时间正序排在最前，所以即使文字换行超出面板，
+     * 先被截掉的也只会是末尾的普通日志，不会是玩家最该看见的那几条。
+     * 同一条日志不会被取两次；logs 为空时返回空数组。
+     */
+    public recentLogs(highlightCount = 3, total = 5): Array<{
+        text: string; important: boolean;
+    }> {
+        const hi: Array<{ text: string; important: boolean }> = [];
+        const ordinary: Array<{ text: string; important: boolean }> = [];
+        const used = new Set<number>();
+        for (let i = this.logs.length - 1; i >= 0 && hi.length < highlightCount; i--) {
+            if (this.logPriority[i] >= 2) {
+                hi.push({ text: this.logs[i], important: true });
+                used.add(i);
+            }
+        }
+        hi.reverse();
+        for (let i = this.logs.length - 1; i >= 0 && hi.length + ordinary.length < total; i--) {
+            if (used.has(i)) {
+                continue;
+            }
+            ordinary.push({ text: this.logs[i], important: false });
+            used.add(i);
+        }
+        ordinary.reverse();
+        return hi.concat(ordinary);
+    }
+
+    /**
+     * 记一条敌情预警。只对**当前属于玩家**的城池生效；同一座城被多个势力
+     * 图谋时最多并两段，避免面板里塞进一长串读不完的名单。
+     */
+    private markThreat(target: ProvinceState, text: string): void {
+        if (target.owner !== this.playerFaction) {
+            return;
+        }
+        const prev = this.threats.get(target.id);
+        if (!prev) {
+            this.threats.set(target.id, text);
+        } else if (prev.split('；').length < 2) {
+            this.threats.set(target.id, `${prev}；${text}`);
+        }
+    }
+
+    /**
+     * 仍然成立的敌情预警：AI 集结后如果当回合就把城打下来了，这条意图
+     * 已经过期，不该再让玩家「回防」一座已经不属于自己的城。
+     */
+    public liveThreats(): Array<{ id: string; city: string; text: string }> {
+        const out: Array<{ id: string; city: string; text: string }> = [];
+        this.threats.forEach((text, id) => {
+            const p = this.provinces.get(id);
+            if (p && p.owner === this.playerFaction) {
+                out.push({ id, city: p.name, text });
+            }
+        });
+        return out;
     }
 
     // ------------------------------------------------------------------
@@ -1334,7 +1432,7 @@ export class GameState {
             parts.push(`自动${POLICY_NAME[this.lastOrder]} ${dom.auto} 城`);
         }
         if (parts.length > 0) {
-            this.pushLog(`内政结算：${parts.join('、')}。`);
+            this.pushLog(`内政结算：${parts.join('、')}。`, 1);
         }
         const econ = this.runEconomy();
         // 补给线排在 AI 行动之前：双方都用「补给后」的兵力打仗，保持对称。
@@ -1369,6 +1467,11 @@ export class GameState {
 
     /** AI 阶段：各势力按简单评分决策 */
     private runAiPhase(): TurnReport {
+        // 敌情预警只保留「上一次 AI 阶段」的意图：玩家整个回合都能看见它，
+        // 到下一次结算再刷新。放在这里清而不是 endTurn() 开头，是为了让
+        // UI 在玩家回合里读到的是上一轮集结、而不是空的。
+        this.threats.clear();
+
         // 先记下玩家回合开始时拥有的城。AI 会直接改写 ProvinceState.owner，
         // 不留快照的话事后就分不清「这回合丢了哪几座城」。
         const mineBefore: string[] = [];
@@ -1694,8 +1797,13 @@ export class GameState {
                 }
                 if (moved > 0 && target.owner === this.playerFaction) {
                     const f = FACTION_MAP[fid];
+                    const desc = `${f ? f.name : fid} 集结 ${moved} 兵于 ${main.name}`;
+                    // 这条是 AI 的「意图预警」：玩家看完可以提前一回合调兵回防。
+                    // 必须钉成要闻，否则会被后面各势力的攻城战报冲出窗口。
                     this.pushLog(`${f ? f.name : fid} 自后方集结 ${moved} 兵于 `
-                        + `${main.name}，图谋 ${target.name}。`);
+                        + `${main.name}，图谋 ${target.name}。`, 2);
+                    // 战报会被后续日志冲走，敌情预警要留到玩家下个回合仍可见。
+                    this.markThreat(target, desc);
                 }
             } else {
                 this.aiAssignGenerals(fid, main);
@@ -2087,7 +2195,11 @@ export class GameState {
             });
         });
 
+        // 战报、重要度与敌情预警都是「上一回合的过程信息」，不在存档里；
+        // 读档后不重建，避免旧局的「敌军图谋」挂到新局面城池上。
         this.logs = [];
+        this.logPriority = [];
+        this.threats.clear();
         return true;
     }
 

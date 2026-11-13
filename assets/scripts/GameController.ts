@@ -71,6 +71,10 @@ export class GameController extends Component {
     private logNode: Node = null!;
     private logLabel: Label = null!;
 
+    /** 敌情预警条：AI 集结意图留到玩家回合常驻可见，没有敌情时整块隐藏 */
+    private threatNode: Node = null!;
+    private threatLabel: Label = null!;
+
     private endTurnBtn: Node = null!;
 
     // 内政四选一（治理 / 屯田 / 筑城 / 征兵）与军事两键，分两行摆
@@ -888,12 +892,39 @@ export class GameController extends Component {
 
         // ---- 战报 ----
         // 身份牌占掉了顶栏下方 44px，战报顺势下移，避免两块 UI 叠在一起。
-        this.logNode = makeBox('LogBox', 340, 96, root);
+        // 战报窗口加高到 5 行：AI 增强后一回合能写十几条，只显示 4 条时
+        // 玩家丢城 / 被夹击 / 对手集结图谋这类要闻会被 AI 互殴日志冲掉。
+        // 半透明底板：战报原本直接压在地图底色 / 城池标签上，几乎读不清。
+        // 只加一层暗底，不改地图绘制，也不遮挡点击（底板同样不拦截事件）。
+        this.logNode = makeRectStroke('LogBox', 340, 140,
+            new Color(22, 19, 15, 190), new Color(120, 105, 78, 140), 1, root);
         addWidget(this.logNode, { left: 16, top: 156 + this.topInset });
         this.logLabel = makeLabel('LogTxt', '', {
             size: 16, color: new Color(230, 225, 210, 200), align: HorizontalTextAlignment.LEFT,
-            width: 340, height: 96,
+            width: 340, height: 140,
         }, this.logNode);
+        // 顶部对齐 + 裁剪溢出行：即使日志很长，被截掉的也只会是末尾的普通日志，
+        // 钉在顶部的要闻一定完整可见；也不会再自动增高溢出到地图上压住城池标签。
+        this.logLabel.verticalAlign = Label.VerticalAlign.TOP;
+        this.logLabel.overflow = Label.Overflow.CLAMP;
+        this.logLabel.enableWrapText = true;
+
+        // ---- 敌情预警 ----
+        // 战报只在窗口里留最后几行，AI「自后方集结、图谋某城」很快会被冲走；
+        // 但玩家真正需要的正是这一回合的提前量：看见预警才能调兵回防。
+        // 紧贴战报下方单独开一条，只在有敌情时出现，不占平时地图视野。
+        this.threatNode = makeRectStroke('ThreatBox', 340, 66,
+            new Color(74, 30, 24, 238), new Color(236, 138, 92, 235), 2, root);
+        addWidget(this.threatNode, { left: 16, top: 302 + this.topInset });
+        this.threatNode.active = false;
+        this.threatLabel = makeLabel('ThreatTxt', '', {
+            size: 16, color: new Color(255, 214, 170, 255), bold: true,
+            align: HorizontalTextAlignment.LEFT,
+            width: 326, height: 60, lineHeight: 20,
+        }, this.threatNode);
+        this.threatLabel.verticalAlign = Label.VerticalAlign.TOP;
+        this.threatLabel.overflow = Label.Overflow.CLAMP;
+        this.threatLabel.enableWrapText = true;
 
         // ---- 结束回合按钮 ----
         // 放在面板上方的右侧，与提示条同一带
@@ -1595,8 +1626,13 @@ export class GameController extends Component {
             ? gen.slice(0, 3).map((g) => `${g.def.name}(${g.level})`).join('、')
             : '无';
 
+        // 被图谋的城在标题行也标一下：玩家点开面板看数值时不会漏掉敌情，
+        // 对策（可调兵的相邻城）就在下面右栏。
+        const threatened = p.owner === this.state.playerFaction
+            && this.state.threats.has(p.id);
         this.panelTitle.string = `${p.name}${p.def.city ? ' ★' : ''}　`
-            + `归属：${f ? f.name : '中立'}`;
+            + `归属：${f ? f.name : '中立'}`
+            + (threatened ? '　! 敌军图谋此城' : '');
 
         // 两栏布局：左栏数值、右栏战术提示。面板是横向宽条，单列太浪费。
         const mine = p.owner === this.state.playerFaction;
@@ -2298,18 +2334,42 @@ export class GameController extends Component {
         this.troopLabel.string = `兵力 ${st.totalTroops(st.playerFaction)}`;
         this.provLabel.string = `据点 ${mine} / ${st.provinces.size}`;
 
-        // 提示
-        if (!this.selected) {
-            this.hintLabel.string = '橙红路可进攻 · 绿/浅色不能打 · 全图常显';
-        } else if (this.selected.owner === st.playerFaction) {
-            this.hintLabel.string = `已选 ${this.selected.name} · 内政四选一，结束回合执行`;
+        // 敌情预警：只列城还属于我的意图（当回合已被打下来的城不用再回防）。
+        const threats = st.liveThreats();
+        if (threats.length > 0) {
+            this.threatNode.active = true;
+            const lines = threats.slice(0, 2).map((t) => `! 图谋 ${t.city}：${t.text}`);
+            if (threats.length > 2) {
+                lines.push(`另有 ${threats.length - 2} 处敌情，查看战报`);
+            }
+            this.threatLabel.string = lines.join('\n');
         } else {
-            this.hintLabel.string = `敌方 ${this.selected.name}：选择我方相邻城池发起进攻`;
+            this.threatNode.active = false;
+            this.threatLabel.string = '';
         }
 
-        // 战报最后 6 条
-        const logs = st.logs.slice(-4);
-        this.logLabel.string = logs.join('\n');
+        // 提示：选中被图谋的城时直接给对策；进攻 / 调兵模式的提示由
+        // showAttackMenu / showMoveMenu 在本函数之后覆盖，优先级更高。
+        const sel = this.selected;
+        const selThreat = sel && threats.some((t) => t.id === sel.id);
+        if (selThreat) {
+            this.hintLabel.string = `! 敌军图谋 ${sel!.name}，可调兵回防`;
+        } else if (!sel) {
+            this.hintLabel.string = threats.length > 0
+                ? `! 有 ${threats.length} 处敌情，点城池查看并调兵回防`
+                : '橙红路可进攻 · 绿/浅色不能打 · 全图常显';
+        } else if (sel.owner === st.playerFaction) {
+            this.hintLabel.string = `已选 ${sel.name} · 内政四选一，结束回合执行`;
+        } else {
+            this.hintLabel.string = `敌方 ${sel.name}：选择我方相邻城池发起进攻`;
+        }
+
+        // 战报：要闻（! 开头）置顶，普通日志补位。
+        // recentLogs() 保证玩家相关战况不会被其他势力的战报挤出窗口。
+        const recent = st.recentLogs(3, 5);
+        this.logLabel.string = recent
+            .map((x) => `${x.important ? '! ' : '  '}${x.text}`)
+            .join('\n');
     }
 
     update(dt: number): void {

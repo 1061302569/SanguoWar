@@ -182,6 +182,7 @@ font_big = load_font(26, bold=True)
 font_mid = load_font(22, bold=True)
 font_small = load_font(20, bold=True)
 font_tiny = load_font(18)
+font_log = load_font(16)
 
 
 def widget_box(w, h, left=None, right=None, top=None, bottom=None, hcenter=None):
@@ -246,27 +247,50 @@ eb = widget_box(150, 60, right=20, bottom=316)
 draw_rect(eb, (150, 60, 45, 255), (230, 190, 110, 255))
 draw_text_at((eb[0] + eb[2]) / 2, (eb[1] + eb[3]) / 2, '结束回合', font_big, (255, 240, 210, 255))
 
-# 提示条（面板上方左侧）
+# 提示条（面板上方左侧）：示意选中被图谋的城时给出的对策
 hb = widget_box(520, 30, left=24, bottom=316)
-draw_text_at(hb[0] + 4, (hb[1] + hb[3]) / 2, '橙红路可进攻 · 绿/浅色不能打 · 全图常显', font_mid,
+draw_text_at(hb[0] + 4, (hb[1] + hb[3]) / 2, '! 敌军图谋 洛阳，可调兵回防', font_mid,
              (255, 235, 180, 255), 'lm')
 
-# 战报（左上，顶栏下方）
-# 框里顺手写两行结算反馈，用来目视检查「后方补给 / 月募兵 / 内政」这几个
-# 新加进 toast 的字段会不会挤出 560px 的提示条（真实文案是单行，这里折成两行示意）。
-lb = widget_box(340, 96, left=16, top=108)
-d.rectangle(box_pil(*lb), outline=(120, 200, 255, 100), width=1)
-draw_text_at((lb[0] + lb[2]) / 2, lb[3] - 12, '战报 340x96', font_tiny, (120, 200, 255, 200))
-for k, line in enumerate(['新回合 +1240金 +680粮',
-                          '募400 补320 · 内政3城（自动2）']):
-    draw_text_at(lb[0] + 12, lb[3] - 42 - k * 26, line, font_tiny,
-                 (210, 225, 235, 235), 'lm')
+# 常驻身份牌（顶栏下方 44px，战报据此下移到 top=156）
+fb = widget_box(300, 44, left=16, top=104)
+draw_rect(fb, (28, 24, 18, 235), (210, 178, 108, 230))
+draw_rect((fb[0] + 6, fb[1] + 9, fb[0] + 32, fb[1] + 35), (190, 40, 20, 255))
+draw_text_at(fb[0] + 44, (fb[1] + fb[3]) / 2, '我方 曹操 · 3 城', font_small,
+             (240, 225, 190, 255), 'lm')
+
+# 战报：340x140、顶部对齐 + CLAMP，5 行。要闻（! 开头）钉在最上面，
+# 普通日志补位；这里按真实 recentLogs(3,5) 的排法画一帧。
+lb = widget_box(340, 140, left=16, top=156)
+draw_rect(lb, (22, 19, 15, 190), (120, 105, 78, 140), 1)
+draw_text_at((lb[0] + lb[2]) / 2, lb[3] - 12, '战报 340x140', font_log, (120, 200, 255, 200))
+log_lines = [
+    ('! 袁绍 自后方集结 8751 兵于 长安，图谋 洛阳', True),
+    ('! 长安 进攻 洛阳 失利', True),
+    ('  招募 400 · 补 320 · 内政3城（自动2）', False),
+    ('  孙策 治理 建业（发展度 +8）', False),
+    ('  刘表 进攻 江陵 失利', False),
+]
+for k, (line, hi) in enumerate(log_lines):
+    draw_text_at(lb[0] + 8, lb[3] - 30 - k * 22, line, font_log,
+                 (255, 214, 170, 255) if hi else (210, 225, 235, 220), 'lm')
+
+# 敌情预警条：紧贴战报下方，只在有敌情时出现，留到玩家整个回合
+tb = widget_box(340, 66, left=16, top=302)
+draw_rect(tb, (74, 30, 24, 238), (236, 138, 92, 235))
+draw_text_at(tb[0] + 8, tb[3] - 14, '! 图谋 洛阳：袁绍 集结 8751 兵于 长安', font_log,
+             (255, 214, 170, 255), 'lm')
+draw_text_at(tb[0] + 8, tb[3] - 34, '点选该城，用「调兵」把后方兵力堆回前线', font_log,
+             (255, 190, 150, 235), 'lm')
+draw_text_at(tb[0] + 8, tb[3] - 54, '敌情预警（每回合 AI 阶段刷新）', font_tiny,
+             (236, 138, 92, 255), 'lm')
 
 # 省份面板：底部抽屉 720x300
 pb = widget_box(720, 300, hcenter=0, bottom=0)
 draw_rect(pb, (28, 24, 18, 248), (190, 160, 100, 220))
 x0, y0, x1, y1 = pb
-draw_text_at(x0 + 18, y1 - 22, '洛阳 ★　归属：曹操', font_big, (255, 230, 170, 255), 'lm')
+draw_text_at(x0 + 18, y1 - 22, '洛阳 ★　归属：曹操　! 敌军图谋此城', font_big,
+             (255, 230, 170, 255), 'lm')
 
 # 内政只留一套按钮：标题行不再摆第二套「治理/屯田/筑城/征兵」
 # 自动开关（内政行最左，66x50，Widget left=142 bottom=64）

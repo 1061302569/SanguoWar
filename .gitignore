@@ -28,6 +28,8 @@ node_modules/
 #//////////////////////////
 tools/.bundle.*.ts
 tools/.logic-test.bundle.ts
+# 调参 / 试玩用的临时探针（以点号开头，收尾时删除；勿误提交）
+tools/.probe-*.ts
 tools/*.log
 tools/*.pid
 
