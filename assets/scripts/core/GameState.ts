@@ -10,7 +10,7 @@ import {
     FactionDef, GeneralDef, GeneralState, ProvinceState, DomesticOrderKey, RulerBonusKey,
 } from '../data/Types';
 import { resolveBattle, CombatSide, random } from './Combat';
-import { RunStats, emptyStats, sanitizeStats } from './Profile';
+import { RunStats, emptyStats, sanitizeStats, isDateKey } from './Profile';
 
 /** 每回合产生的财政报告 */
 export interface TurnReport {
@@ -206,6 +206,15 @@ export class GameState {
     public stats: RunStats = emptyStats();
 
     /**
+     * 本局是否为每日挑战局：存的是当天日期键（YYYY-MM-DD），空串 = 普通局。
+     *
+     * 只记「哪一天」，不记种子 —— 种子由 `dailyChallengeOf(date)` 纯函数
+     * 重新推导，所以读档、换设备、隔天再读都能算出同一个种子。
+     * 结算时靠它决定是否更新档案里的今日挑战成绩。
+     */
+    public dailyDate = '';
+
+    /**
      * 每回合结算完成后的回调 —— UI 的**统一刷新入口**
      *
      * ⚠ AI 阶段会直接改写 ProvinceState.owner / troops，而地图版图颜色只在
@@ -282,6 +291,9 @@ export class GameState {
         // 开局城数是阶段目标的基准：换剧本 / 换势力都按本局起手推算，
         // 不会出现「一开局目标就已达成」。
         this.stats = emptyStats(this.provincesOf(this.playerFaction).length);
+        // 每日挑战标记属于「这一局怎么开的」，重开必须清掉；
+        // 由 startNewGame() 在 reset() 之后按需写回。
+        this.dailyDate = '';
     }
 
     /**
@@ -2084,6 +2096,8 @@ export class GameState {
             lastOrder: this.lastOrder,
             // 本局战绩：与局面同存亡，新开一局由 reset() 清零
             stats: this.stats,
+            // 每日挑战标记；普通局写空串，读档时按需恢复种子
+            daily: this.dailyDate,
         };
     }
 
@@ -2243,6 +2257,12 @@ export class GameState {
             this.provincesOf(this.playerFaction).length,
         );
 
+        // 每日挑战标记：只接受合法日期键，脏值一律当普通局，
+        // 免得一条坏字段让结算时去更新一个不存在的日期。
+        this.dailyDate = typeof data.daily === 'string' && isDateKey(data.daily)
+            ? data.daily
+            : '';
+
         // 战报、重要度与敌情预警都是「上一回合的过程信息」，不在存档里；
         // 读档后不重建，避免旧局的「敌军图谋」挂到新局面城池上。
         this.logs = [];
@@ -2310,6 +2330,8 @@ export interface SaveData {
     policy?: DomesticPolicy;
     /** 本局战绩；可选，旧存档缺失时按开局城数与当前城数重建 */
     stats?: RunStats;
+    /** 每日挑战的日期键（YYYY-MM-DD）；可选，缺失 / 脏值 = 普通局 */
+    daily?: string;
 }
 
 /** 全部势力列表（避免循环依赖，这里再导出一次） */

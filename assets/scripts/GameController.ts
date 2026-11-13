@@ -4,10 +4,13 @@ import {
 } from 'cc';
 import { GameState, DomesticOrder, POLICY_NAME } from './core/GameState';
 import { Balance } from './core/Balance';
+import { setRandom } from './core/Combat';
 import {
     PROFILE_KEY, PlayerProfile, RunResult, defaultProfile, sanitizeProfile,
     TUTORIAL_STEPS, OBJECTIVE_IDS, OBJECTIVE_NAMES, objectiveLevel, objectiveLines,
     tutorialLine, gradeOf, shareTextOf, recordResult, profileLine,
+    ACHIEVEMENTS, AchievementDef, achievementLine, unlockedBy,
+    dailyChallengeOf, dailyKeyOf, dailyLine, isDateKey, makeSeededRandom, recordDaily,
 } from './core/Profile';
 import { Geo } from './core/Geo';
 import { MapCamera } from './core/MapCamera';
@@ -194,7 +197,24 @@ export class GameController extends Component {
     /** 本局战绩是否已计入档案：结算面板可能被反复打开，只能记一次 */
     private resultRecorded = false;
 
+    // ---- P2：成就图鉴 / 每日挑战 ----
+    /** 成就面板（和剧本 / 结算 / 俘虏营共用同一层遮罩） */
+    private achievePanel: Node = null!;
+    private achieveTitle: Label = null!;
+    private achievePrevBtn: Node = null!;
+    private achieveNextBtn: Node = null!;
+    /** 固定 8 行，按当前页填充（与剧本卡片、俘虏营同一套路） */
+    private achieveRows: Array<{ name: Label; desc: Label; mark: Label }> = [];
+    private achievePage = 0;
+    private static readonly ACHIEVE_PER_PAGE = 8;
+    /** 剧本面板里的「今日挑战」摘要行 */
+    private dailySummary: Label = null!;
+
     onLoad(): void {
+        // 随机源默认就是 Math.random；显式设一次，避免上一次每日挑战
+        // 留下的固定种子在同一次会话里漏到普通局。
+        setRandom(Math.random);
+
         // ---- 局外档案：独立 key，开局就恢复，结算与引导都读它 ----
         this.profile = sanitizeProfile(loadData(PROFILE_KEY));
         setShareText(this.profile.lastResult || DEFAULT_SHARE);
@@ -304,10 +324,27 @@ export class GameController extends Component {
             return false;
         }
         if (this.state.deserialize(data)) {
+            // 随机源必须跟着局面一起恢复：每日挑战局用当天同一个种子，
+            // 普通局回到 Math.random。否则「打了一半的挑战局」读回来
+            // 会变成普通随机，成绩就没法比较了。
+            this.applyDailySeed(this.state.dailyDate);
             this.state.pushLog(`已读取存档：${this.state.dateText()}，第 ${this.state.turn} 回合。`);
             return true;
         }
         return false;
+    }
+
+    /**
+     * 切换随机源：空串 = 普通局（Math.random），否则按当天种子重放。
+     * 种子由 `dailyChallengeOf()` 纯函数推导，所以读档 / 换设备都一致。
+     */
+    private applyDailySeed(dailyDate: string): void {
+        if (dailyDate && isDateKey(dailyDate)) {
+            const ch = dailyChallengeOf(dailyDate, SCENARIOS);
+            setRandom(makeSeededRandom(ch.seed));
+        } else {
+            setRandom(Math.random);
+        }
     }
 
     /** 保存当前局面 */
@@ -326,7 +363,7 @@ export class GameController extends Component {
      * 统一了「重置状态、清存档、重建地图引用、重置视野、刷新 UI」的顺序，
      * 避免各处各写一套导致重开后点到上一局的城池数据。
      */
-    private startNewGame(scenarioId?: string, factionId?: string): void {
+    private startNewGame(scenarioId?: string, factionId?: string, dailyDate?: string): void {
         const sid = scenarioId || this.state.scenarioId;
         const fid = factionId || this.state.playerFaction;
 
@@ -336,6 +373,9 @@ export class GameController extends Component {
         saveData(SAVE_KEY, null);
 
         this.state.reset(sid, fid);
+        // 每日挑战标记要在落盘之前写好：读档时靠它恢复同一个随机种子
+        this.state.dailyDate = dailyDate && isDateKey(dailyDate) ? dailyDate : '';
+        this.applyDailySeed(this.state.dailyDate);
         this.gameOverShown = false;
         this.resultRecorded = false;
         this.goalShownLevel = -1;
@@ -356,9 +396,28 @@ export class GameController extends Component {
         const f = FACTION_MAP[fid];
         const name = f ? f.name : fid;
         const mine = this.state.provincesOf(fid).length;
-        // 换剧本 / 换势力之后最容易「不知道自己是谁」，横幅必须点名执掌势力
-        this.showBanner(`你执掌 ${name} · ${mine} 城`);
-        this.toast(`${sc.name}开局 · 带金环的城是你的地盘，橙红箭头能打`);
+        if (this.state.dailyDate) {
+            // 挑战局必须让玩家一眼看出「这不是普通局」：
+            // 横幅点名日期与势力，toast 说清规则（同一天所有人同一局面）。
+            this.showBanner(`每日挑战 · ${name}`);
+            this.toast(`${this.state.dailyDate} 挑战局 · 同一天所有人同一局面，比谁回合少`);
+        } else {
+            // 换剧本 / 换势力之后最容易「不知道自己是谁」，横幅必须点名执掌势力
+            this.showBanner(`你执掌 ${name} · ${mine} 城`);
+            this.toast(`${sc.name}开局 · 带金环的城是你的地盘，橙红箭头能打`);
+        }
+    }
+
+    /** 开始今天的每日挑战：固定剧本 + 固定势力 + 固定种子 */
+    private startDailyChallenge(): void {
+        const key = dailyKeyOf();
+        const ch = dailyChallengeOf(key, SCENARIOS);
+        if (!ch.scenarioId || !ch.factionId) {
+            this.toast('今日挑战配置异常，请稍后再试');
+            return;
+        }
+        this.audio.play('click');
+        this.startNewGame(ch.scenarioId, ch.factionId, key);
     }
 
     /** 检查本局是否已结束；已弹过结算就不再重复弹 */
@@ -424,8 +483,9 @@ export class GameController extends Component {
         this.menuLayer.active = true;
         this.scenarioPanel.active = true;
         this.resultPanel.active = false;
-        // 三个弹窗共用同一层遮罩，必须互斥：不然从俘虏营切过来会两层叠在一起
+        // 四个弹窗共用同一层遮罩，必须互斥：不然从俘虏营切过来会两层叠在一起
         this.prisonPanel.active = false;
+        this.achievePanel.active = false;
         this.refreshScenarioMenu();
     }
 
@@ -433,6 +493,69 @@ export class GameController extends Component {
         if (this.menuLayer) {
             this.menuLayer.active = false;
         }
+    }
+
+    // ==================================================================
+    // 成就图鉴
+    // ==================================================================
+
+    /** 打开成就图鉴：与剧本 / 结算 / 俘虏营互斥，共用同一层遮罩 */
+    private openAchieveMenu(): void {
+        this.achievePage = 0;
+        this.menuLayer.active = true;
+        this.scenarioPanel.active = false;
+        this.resultPanel.active = false;
+        this.prisonPanel.active = false;
+        this.achievePanel.active = true;
+        this.refreshAchieveMenu();
+        this.audio.play('click');
+    }
+
+    private achievePageCount(): number {
+        return Math.max(1, Math.ceil(ACHIEVEMENTS.length / GameController.ACHIEVE_PER_PAGE));
+    }
+
+    private onAchievePage(delta: number): void {
+        this.achievePage = Math.min(
+            this.achievePageCount() - 1, Math.max(0, this.achievePage + delta),
+        );
+        this.refreshAchieveMenu();
+    }
+
+    /** 按当前页填充 8 行；未解锁的只显示灰字，不隐藏 —— 图鉴要让人看见目标 */
+    private refreshAchieveMenu(): void {
+        const pages = this.achievePageCount();
+        const got = this.profile.achievements.length;
+        this.achieveTitle.string = `成就图鉴　${got}/${ACHIEVEMENTS.length}　`
+            + `${this.achievePage + 1}/${pages}`;
+
+        const start = this.achievePage * GameController.ACHIEVE_PER_PAGE;
+        this.achieveRows.forEach((r, i) => {
+            const a = ACHIEVEMENTS[start + i];
+            const row = r.mark.node.parent;
+            if (row) {
+                row.active = !!a;
+            }
+            if (!a) {
+                return;
+            }
+            const unlocked = this.profile.achievements.indexOf(a.id) >= 0;
+            r.mark.string = unlocked ? '有' : '无';
+            r.mark.color = unlocked
+                ? new Color(255, 215, 120, 255)
+                : new Color(120, 115, 100, 255);
+            r.name.string = a.name;
+            r.name.color = unlocked
+                ? new Color(255, 232, 180, 255)
+                : new Color(165, 158, 142, 255);
+            r.desc.string = unlocked ? a.desc : `${a.desc}（未解锁）`;
+            r.desc.color = unlocked
+                ? new Color(205, 195, 172, 255)
+                : new Color(130, 125, 112, 255);
+        });
+
+        this.achievePrevBtn.active = pages > 1 && this.achievePage > 0;
+        this.achieveNextBtn.active = pages > 1 && this.achievePage < pages - 1;
     }
 
     private onPickScenario(id: string): void {
@@ -496,6 +619,18 @@ export class GameController extends Component {
         this.menuInfo.string = `当前选择：${sc.era}　难度 ${sc.difficulty}　`
             + `执掌 ${f ? f.name : this.pickFactionId}\n`
             + '开始新局会清空当前进度，此操作不可撤销。';
+
+        // 今日挑战摘要：不必点进去就知道「今天打没打、最好几回合」，
+        // 第二行写清规则 —— 固定局面才值得比较，否则玩家会以为是普通随机局。
+        const key = dailyKeyOf();
+        const ch = dailyChallengeOf(key, SCENARIOS);
+        const chSc = ch.scenarioId ? getScenario(ch.scenarioId) : null;
+        const chF = FACTION_MAP[ch.factionId];
+        const streak = this.profile.dailyStreak > 0
+            ? ` · 连续 ${this.profile.dailyStreak} 天` : '';
+        this.dailySummary.string = `${dailyLine(this.profile, key)}${streak}\n`
+            + `今日：${chSc ? chSc.name : '—'} · 执掌 ${chF ? chF.name : '—'}`
+            + '　同一天所有人同一局面，比谁回合少';
     }
 
     /**
@@ -511,16 +646,23 @@ export class GameController extends Component {
         this.scenarioPanel.active = false;
         this.resultPanel.active = true;
         this.prisonPanel.active = false;
+        this.achievePanel.active = false;
 
         const sc = getScenario(this.state.scenarioId);
         const f = FACTION_MAP[this.state.playerFaction];
         const mine = this.state.provincesOf(this.state.playerFaction).length;
         const total = this.state.provinces.size;
         const s = this.state.stats;
+        const isDaily = !!this.state.dailyDate;
+        // 破纪录要跟「记录前」的今日最佳比，所以先取一份旧值
+        const prevBest = isDaily && this.profile.daily.date === this.state.dailyDate
+            ? this.profile.daily.bestTurns : 0;
         const result: RunResult = {
             win,
             faction: f ? f.name : this.state.playerFaction,
             scenario: sc.name,
+            scenarioId: this.state.scenarioId,
+            daily: isDaily,
             turns: this.state.turn,
             cities: mine,
             total,
@@ -530,28 +672,53 @@ export class GameController extends Component {
 
         // 结算面板会被反复打开（读档进来、剧本弹窗返回、继续看看后再看），
         // 累计档案只能记一次，否则 plays / wins 会虚高。
+        let fresh: AchievementDef[] = [];
         if (!this.resultRecorded) {
+            // 顺序不能反：成就判定看的是「记录前」的档案（比如累计 10 局），
+            // 先写档案再判定就永远差一局。
+            fresh = unlockedBy(result, this.profile);
             this.profile = recordResult(this.profile, result);
+            if (isDaily) {
+                this.profile = recordDaily(
+                    this.profile, this.state.dailyDate, win, this.state.turn,
+                );
+            }
             this.saveProfile();
             this.resultRecorded = true;
         }
         // 右上角「···」转发立刻带上本局成绩，而不再是开局那句静态标语
         setShareText(share);
 
-        this.resultTitle.string = win ? '天下一统' : '大势已去';
-        this.resultBody.string = [
-            `剧本　${sc.name}（${sc.era}） · 执掌 ${f ? f.name : this.state.playerFaction}`,
-            `用时　第 ${this.state.turn} 回合 · ${this.state.dateText()}　评价 ${gradeOf(win, this.state.turn)}`,
-            `据点　${mine} / ${total}　最大版图 ${s.maxCities} 城`,
-            `战绩　攻占 ${s.captures} 城 · 丢城 ${s.losses} 次`,
-            `　　　收降 ${s.persuaded} 人 · 放归 ${s.released} 人`,
+        const lines: string[] = [
+            `剧本　${sc.name}（${sc.era}）`,
+            `执掌　${f ? f.name : this.state.playerFaction}　`
+                + `用时 第 ${this.state.turn} 回合 · ${this.state.dateText()}`,
+            `评价　${gradeOf(win, this.state.turn)}　`
+                + `据点 ${mine}/${total} · 最大版图 ${s.maxCities} 城`,
+            `战绩　攻占 ${s.captures} 城 · 丢城 ${s.losses} 次 · `
+                + `收降 ${s.persuaded} 人 · 放归 ${s.released} 人`,
+            fresh.length > 0
+                ? `成就　新解锁 ${fresh.map((a) => a.name).join('、')}`
+                : `成就　${achievementLine(this.profile)}`,
+        ];
+        if (isDaily) {
+            const d = this.profile.daily;
+            const newBest = win && (prevBest === 0 || this.state.turn < prevBest);
+            lines.push(d.cleared
+                ? `每日　今日最佳 ${d.bestTurns} 回合${newBest ? '（新纪录）' : ''}`
+                    + ` · 已战 ${d.plays} 局`
+                : `每日　今日尚未通关 · 已战 ${d.plays} 局`);
+        }
+        lines.push(
             '',
             profileLine(this.profile),
             '',
-            `分享语　${share}`,
             win ? '四海归一 · 换个剧本，或挑战更快回合数。'
                 : '基业尽失 · 这局的最远版图已经记进档案。',
-        ].join('\n');
+        );
+
+        this.resultTitle.string = win ? '天下一统' : '大势已去';
+        this.resultBody.string = lines.join('\n');
     }
 
     // ==================================================================
@@ -567,6 +734,7 @@ export class GameController extends Component {
         this.menuLayer.active = true;
         this.scenarioPanel.active = false;
         this.resultPanel.active = false;
+        this.achievePanel.active = false;
         this.prisonPanel.active = true;
         this.refreshPrisonMenu();
         this.audio.play('click');
@@ -1108,7 +1276,10 @@ export class GameController extends Component {
         this.menuLayer = mask;
 
         // ---------------- 剧本选择 ----------------
-        const sp = makeRectStroke('ScenarioPanel', 640, 820,
+        // 高度 820 → 900：底部腾出一行给「今日挑战 / 成就图鉴」两个常驻入口。
+        // 这两个是 P2 的「明天还回来」钩子，放进面板而不是顶栏 ——
+        // 顶栏右侧 2x2 已经满了，再加按钮会压到地图。
+        const sp = makeRectStroke('ScenarioPanel', 640, 900,
             new Color(30, 25, 18, 252), new Color(190, 160, 100, 230), 2, mask);
         addWidget(sp, { hCenter: 0, vCenter: 0 });
         this.scenarioPanel = sp;
@@ -1116,23 +1287,23 @@ export class GameController extends Component {
         const title = makeLabel('MenuTitle', '新开一局 · 选择剧本', {
             size: 30, color: new Color(255, 230, 170, 255), bold: true,
         }, sp);
-        setPos(title.node, 0, 370);
+        setPos(title.node, 0, 410);
         this.menuSub = makeLabel('MenuSub', '', {
             size: 17, color: new Color(200, 190, 170, 255),
         }, sp);
-        setPos(this.menuSub.node, 0, 332);
+        setPos(this.menuSub.node, 0, 372);
 
         // 翻页按钮：剧本以后会越来越多，卡片复用 + 分页就不用改布局
         this.prevPageBtn = makeRectStroke('MenuPrevBtn', 38, 34,
             new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, sp);
-        setPos(this.prevPageBtn, 250, 332);
+        setPos(this.prevPageBtn, 250, 372);
         makeLabel('MenuPrevTxt', '<', {
             size: 20, color: new Color(240, 225, 190, 255), bold: true,
         }, this.prevPageBtn);
         this.prevPageBtn.on(Node.EventType.TOUCH_END, () => this.onMenuPage(-1), this);
         this.nextPageBtn = makeRectStroke('MenuNextBtn', 38, 34,
             new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, sp);
-        setPos(this.nextPageBtn, 296, 332);
+        setPos(this.nextPageBtn, 296, 372);
         makeLabel('MenuNextTxt', '>', {
             size: 20, color: new Color(240, 225, 190, 255), bold: true,
         }, this.nextPageBtn);
@@ -1215,10 +1386,31 @@ export class GameController extends Component {
             }
         }, this);
 
-        const footer = makeLabel('MenuFooter', '剧本配置在 data/Scenarios.ts，新增一项即多一个剧本', {
-            size: 14, color: new Color(160, 150, 130, 255),
+        // ---- 今日挑战 / 成就图鉴 ----
+        // 这两个入口解决「打完一局为什么还要再来」：一个是每天可比的固定局面，
+        // 一个是跨对局的长期收集。放在剧本面板底部，不占顶栏、不挡地图。
+        const dailyBtn = makeRectStroke('DailyBtn', 290, 48,
+            new Color(58, 78, 96, 255), new Color(140, 195, 235, 235), 2, sp);
+        setPos(dailyBtn, -155, -366);
+        makeLabel('DailyTxt', '今日挑战', {
+            size: 21, color: new Color(220, 240, 255, 255), bold: true,
+        }, dailyBtn);
+        dailyBtn.on(Node.EventType.TOUCH_END, () => this.startDailyChallenge(), this);
+
+        const achieveBtn = makeRectStroke('AchieveBtn', 290, 48,
+            new Color(74, 60, 40, 255), new Color(210, 175, 105, 235), 2, sp);
+        setPos(achieveBtn, 155, -366);
+        makeLabel('AchieveTxt', '成就图鉴', {
+            size: 21, color: new Color(255, 236, 190, 255), bold: true,
+        }, achieveBtn);
+        achieveBtn.on(Node.EventType.TOUCH_END, () => this.openAchieveMenu(), this);
+
+        // 今日挑战摘要 + 规则一句话：玩家不必点进去就知道今天打没打、最好几回合
+        this.dailySummary = makeLabel('MenuDaily', '', {
+            size: 15, color: new Color(215, 200, 170, 255),
+            width: 600, height: 44, lineHeight: 22,
         }, sp);
-        setPos(footer.node, 0, -366);
+        setPos(this.dailySummary.node, 0, -424);
 
         // ---------------- 胜负结算 ----------------
         // 面板加高是为了放下「本局战绩 + 评价 + 档案摘要 + 分享语」；
@@ -1276,6 +1468,67 @@ export class GameController extends Component {
             size: 24, color: new Color(210, 200, 180, 255), bold: true,
         }, stayBtn);
         stayBtn.on(Node.EventType.TOUCH_END, () => this.hideMenu(), this);
+
+        // ---------------- 成就图鉴 ----------------
+        // 第四个共用遮罩的弹窗。一页 8 条、行节点复用：成就数量是固定的
+        // 12 条，但以后加成就也不该重排布局，分页即可。
+        const ap = makeRectStroke('AchievePanel', 640, 820,
+            new Color(30, 25, 18, 252), new Color(210, 175, 105, 235), 2, mask);
+        addWidget(ap, { hCenter: 0, vCenter: 0 });
+        ap.active = false;
+        this.achievePanel = ap;
+
+        this.achieveTitle = makeLabel('AchieveTitle', '', {
+            size: 30, color: new Color(255, 230, 170, 255), bold: true,
+        }, ap);
+        setPos(this.achieveTitle.node, 0, 366);
+
+        for (let i = 0; i < GameController.ACHIEVE_PER_PAGE; i++) {
+            const row = makeRectStroke(`AchieveRow_${i}`, 600, 66,
+                new Color(48, 40, 30, 255), new Color(120, 105, 78, 190), 1, ap);
+            setPos(row, 0, 292 - i * 74);
+            // 左侧状态标记：有 / 无（用汉字而不是勾选符号 —— 系统字体缺字形会渲染成豆腐块）
+            const mark = makeLabel(`AchieveMark_${i}`, '', {
+                size: 24, color: new Color(150, 145, 130, 255), bold: true,
+                align: HorizontalTextAlignment.LEFT, width: 40, height: 30,
+            }, row);
+            setPos(mark.node, -270, 0);
+            const name = makeLabel(`AchieveName_${i}`, '', {
+                size: 19, color: new Color(220, 210, 190, 255), bold: true,
+                align: HorizontalTextAlignment.LEFT, width: 500, height: 26,
+            }, row);
+            setPos(name.node, 34, 14);
+            const desc = makeLabel(`AchieveDesc_${i}`, '', {
+                size: 15, color: new Color(185, 175, 155, 255),
+                align: HorizontalTextAlignment.LEFT, width: 500, height: 24,
+            }, row);
+            setPos(desc.node, 34, -14);
+            this.achieveRows.push({ name, desc, mark });
+        }
+
+        this.achievePrevBtn = makeRectStroke('AchievePrevBtn', 70, 40,
+            new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, ap);
+        setPos(this.achievePrevBtn, -150, -300);
+        makeLabel('AchievePrevTxt', '<', {
+            size: 20, color: new Color(240, 225, 190, 255), bold: true,
+        }, this.achievePrevBtn);
+        this.achievePrevBtn.on(Node.EventType.TOUCH_END, () => this.onAchievePage(-1), this);
+
+        this.achieveNextBtn = makeRectStroke('AchieveNextBtn', 70, 40,
+            new Color(60, 50, 38, 255), new Color(150, 125, 80, 220), 2, ap);
+        setPos(this.achieveNextBtn, 150, -300);
+        makeLabel('AchieveNextTxt', '>', {
+            size: 20, color: new Color(240, 225, 190, 255), bold: true,
+        }, this.achieveNextBtn);
+        this.achieveNextBtn.on(Node.EventType.TOUCH_END, () => this.onAchievePage(1), this);
+
+        const achieveClose = makeRectStroke('AchieveCloseBtn', 220, 50,
+            new Color(70, 58, 42, 255), new Color(190, 160, 100, 220), 2, ap);
+        setPos(achieveClose, 0, -364);
+        makeLabel('AchieveCloseTxt', '返回剧本', {
+            size: 22, color: new Color(240, 225, 190, 255), bold: true,
+        }, achieveClose);
+        achieveClose.on(Node.EventType.TOUCH_END, () => this.openScenarioMenu(), this);
 
         // ---------------- 俘虏营 ----------------
         // 第三个共用遮罩的弹窗：攻破敌城生擒的守将在这里二选一处置。
@@ -2558,9 +2811,14 @@ export class GameController extends Component {
             this.goalLabel.string = `${line}\n完成后解锁阶段目标`;
         } else {
             const mine = st.provincesOf(st.playerFaction).length;
-            this.goalLabel.string = objectiveLines(
+            const obj = objectiveLines(
                 mine, st.provinces.size, st.stats.openingCities, this.profile,
-            ).join('\n');
+            );
+            // 每日挑战局：第二行换成「今日最佳」，玩家随时知道离自己的纪录差多少。
+            // 阶段目标的描述在这一行本来只是复述，让位给当天可比成绩更值。
+            this.goalLabel.string = st.dailyDate
+                ? `${obj[0]}\n${dailyLine(this.profile, st.dailyDate)}`
+                : obj.join('\n');
         }
     }
 

@@ -411,4 +411,47 @@ draw_text_at(0, -335, '返回战场', font_mid, (240, 225, 190, 255))
 prison_out = os.path.join(ROOT, 'tools', 'ui-prison-preview.png')
 prison_img.save(prison_out)
 print(f'输出 {prison_out}  {prison_img.size}')
+
+# ---------- 成就图鉴弹窗预览 ----------
+# P2 的「明天还回来」：一页 8 条、可翻页；未解锁不隐藏，只变灰 +「（未解锁）」。
+# 单独出一张，用来目视检查行距、状态字（有 / 无）与按钮有没有挤出面板。
+ach_img = img.copy()
+d = ImageDraw.Draw(ach_img, 'RGBA')
+d.rectangle([0, 0, VIEW_W, VIEW_H], fill=(10, 8, 6, 205))
+ap = widget_box(640, 820, hcenter=0)
+draw_rect(ap, (30, 25, 18, 252), (210, 175, 105, 235))
+draw_text_at(0, 366, '成就图鉴　5/12　1/2', font_big, (255, 230, 170, 255))
+
+ach_rows = [
+    ('有', '初战告捷', '攻占第一座城池', True),
+    ('有', '一统天下', '首次统一全国', True),
+    ('有', '神速', '20 回合内统一', True),
+    ('有', '稳健', '28 回合内统一', True),
+    ('有', '折冲樽俎', '单局收降 5 名敌将', True),
+    ('无', '仁义之师', '单局放归 10 名俘虏（未解锁）', False),
+    ('无', '铁壁无缺', '一城不失统一全国（未解锁）', False),
+    ('无', '绝地反击', '丢城 10 次以上仍然统一（未解锁）', False),
+]
+for i, (mark, name, desc, got) in enumerate(ach_rows):
+    cy = 292 - i * 74
+    row = (-300, cy - 33, 300, cy + 33)
+    draw_rect(row, (48, 40, 30, 255), (120, 105, 78, 190), 1)
+    draw_text_at(-270, cy, mark, font_row_bold,
+                 (255, 215, 120, 255) if got else (120, 115, 100, 255))
+    draw_text_at(-216, cy + 14, name, font_row_bold,
+                 (255, 232, 180, 255) if got else (165, 158, 142, 255), 'lm')
+    draw_text_at(-216, cy - 14, desc, font_tiny,
+                 (205, 195, 172, 255) if got else (130, 125, 112, 255), 'lm')
+
+for bx, label in [(-150, '<'), (150, '>')]:
+    b = (bx - 35, -320, bx + 35, -280)
+    draw_rect(b, (60, 50, 38, 255), (150, 125, 80, 220))
+    draw_text_at(bx, -300, label, font_mid, (240, 225, 190, 255))
+cb = (-110, -389, 110, -339)
+draw_rect(cb, (70, 58, 42, 255), (190, 160, 100, 220))
+draw_text_at(0, -364, '返回剧本', font_mid, (240, 225, 190, 255))
+
+ach_out = os.path.join(ROOT, 'tools', 'ui-achieve-preview.png')
+ach_img.save(ach_out)
+print(f'输出 {ach_out}  {ach_img.size}')
 print(f'地图 {MAP_W:.0f}x{MAP_H:.0f}，初始缩放 {fit:.3f}')
