@@ -10,7 +10,11 @@ export interface FactionDef {
     color: string;
     /** 势力特色描述 */
     desc: string;
-    /** 是否为可玩势力 */
+    /**
+     * 历史字段：是否曾作为推荐起始势力。
+     * **不限制玩家能否执掌**——现在所有在剧本里有城的势力都可选，
+     * 快捷按钮与每日挑战池由 ScenarioDef.playable 决定。
+     */
     playable: boolean;
 }
 

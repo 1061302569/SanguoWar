@@ -36,11 +36,11 @@ function bodyOf(src: string, start: string, end: string): string {
     return e > s ? src.slice(s, e) : '';
 }
 
-/** 与 MapRenderer.shade() 一致：按倍率提亮并 clamp 到 255 */
+/** 与 MapRenderer.shade() 一致：先压缩留提亮空间，再乘倍率并 clamp 到 255 */
 function shadeRgb(hex: string, f: number): number[] {
     const n = parseInt(hex.slice(1), 16);
     const rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-    return rgb.map((v) => Math.min(255, Math.round(v * f)));
+    return rgb.map((v) => Math.min(255, Math.round(v * 0.85 * f)));
 }
 
 async function main(): Promise<void> {
@@ -94,7 +94,13 @@ async function main(): Promise<void> {
 
     console.log('== 2. 己方提亮在亮色势力上仍然看得出来 ==');
     // 只提亮不改色相：如果势力色本来就很亮，1.45 和 1.25 会双双 clamp 成纯白，
-    // 「己方提亮一档」就等于没画。新增可选势力时这条会先报出来。
+    // 「己方提亮一档」就等于没画。放开「所有有城势力都可选」时公孙瓒
+    // #e8e3d3 正是这样暴露出来的，所以渲染层先压缩原色留出提亮空间。
+    // 这里复刻的公式必须与 MapRenderer.shade() 完全一致，否则守卫会失真。
+    check(renderer.indexOf('v * 0.85 * f') >= 0,
+        'MapRenderer.shade() 用 0.85 压缩原色（亮色势力也能拉开己方/别家差距）');
+    check(renderer.indexOf('Math.round(v * f)') < 0,
+        '旧的直接倍率提亮已移除（否则近白色势力会双双 clamp 成纯白）');
     for (const fid of Object.keys(playableSeen)) {
         const f = FACTION_MAP[fid];
         const own = shadeRgb(f.color, 1.45);

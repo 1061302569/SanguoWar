@@ -1,6 +1,6 @@
 import { INITIAL_OWNER, PROVINCES } from './Provinces';
 import { INITIAL_GENERAL_POST, GENERALS, RULER_OF, BONUS_KIND } from './Generals';
-import { FACTION_MAP, NEUTRAL } from './Factions';
+import { FACTIONS, FACTION_MAP, NEUTRAL } from './Factions';
 
 /**
  * 剧本（开局配置）
@@ -12,7 +12,9 @@ import { FACTION_MAP, NEUTRAL } from './Factions';
  * 约定：
  *   - owners 未列出的城池为中立（NEUTRAL）
  *   - owners 的 key 必须是 Provinces.ts 里存在的城池 id
- *   - playable 里的势力必须在 owners 中有城，且默认玩家势力在其中
+ *   - playable 是「推荐势力」：只用于剧本面板的快捷按钮与每日挑战抽取池，
+ *     **不限制玩家能选谁**；玩家可执掌 owners 里任何有城的正式势力
+ *   - 默认玩家势力必须在 owners 中有城
  *   - generalPosts 省略时，按「武将所属势力 -> 该势力的城」自动分配
  *
  * 历史年份只用于气氛与开局格局，归属为便于游玩的简化推演，非严格考据。
@@ -31,7 +33,10 @@ export interface ScenarioDef {
     month: number;
     /** 默认玩家势力 */
     playerFaction: string;
-    /** 玩家可选的势力（必须在本剧本有城） */
+    /**
+     * 推荐的快捷势力（必须在本剧本有城）。
+     * 只影响剧本面板里 4 个按钮和每日挑战的抽取池，不是可选势力的白名单。
+     */
     playable: string[];
     /** 省份 id -> 势力 id */
     owners: Record<string, string>;
@@ -189,13 +194,41 @@ export function getScenario(id: string | null | undefined): ScenarioDef {
     return SCENARIOS.find((s) => s.id === id) || SCENARIOS[0];
 }
 
-/** 该剧里玩家可选的势力（过滤掉没有城的势力） */
-export function playableFactions(sc: ScenarioDef): string[] {
+/**
+ * 该剧本里**所有可执掌的势力**：只要在 owners 里有城、且是势力表里的正式势力。
+ *
+ * 以前这里按推荐名单做过滤，等于把 17 家写死成 3~4 家白名单，
+ * 玩家在地图上点了袁绍 / 马腾 / 士燮的城只会收到「本剧本不可执掌」，
+ * 连 GameState.reset() 都会把势力悄悄打回默认。选剧本本该是「选一个时代」，
+ * 执掌谁应该由玩家在地图上自己决定，所以改成按开局版图推导。
+ *
+ * 中立不是势力，没有城的势力选了开局就判负，两者都不放进列表。
+ * 顺序按 Factions.ts 的声明顺序，保证 UI 与存档每次显示一致。
+ */
+export function selectableFactions(sc: ScenarioDef): string[] {
     const hasCity: Record<string, boolean> = {};
     for (const pid of Object.keys(sc.owners)) {
-        hasCity[sc.owners[pid]] = true;
+        const fid = sc.owners[pid];
+        if (fid && fid !== NEUTRAL && FACTION_MAP[fid]) {
+            hasCity[fid] = true;
+        }
     }
-    return sc.playable.filter((fid) => !!hasCity[fid]);
+    return FACTIONS.filter((f) => !!hasCity[f.id]).map((f) => f.id);
+}
+
+/** 玩家可选势力 = 全部有城势力（保留旧函数名，状态层与既有回归都在用） */
+export function playableFactions(sc: ScenarioDef): string[] {
+    return selectableFactions(sc);
+}
+
+/**
+ * 剧本推荐的快捷势力：面板 4 个按钮、每日挑战抽取池。
+ * 与全部可选势力分开，是为了不让十几家势力把固定布局撑爆。
+ */
+export function recommendedFactions(sc: ScenarioDef): string[] {
+    const all = selectableFactions(sc);
+    const list = Array.isArray(sc.playable) ? sc.playable : [];
+    return list.filter((fid) => all.indexOf(fid) >= 0);
 }
 
 /** 地图选势力时显示的势力简报（全部来自剧本静态配置，不依赖当前局面） */
@@ -268,6 +301,30 @@ export function factionBriefOf(sc: ScenarioDef, fid: string): FactionBrief {
         bonus,
         neighbors,
     };
+}
+
+/**
+ * 开局风险提示：放开「所有有城势力都可选」之后，1 城 0 将的势力真的能选，
+ * 但玩家点之前必须知道这是险局，否则一上来就被灭会觉得游戏在骗人。
+ * 只做信息提示，不发任何资源、不改任何平衡数值。
+ */
+export function factionRiskLine(b: FactionBrief): string {
+    if (b.cities <= 1 && b.generals === 0) {
+        return `险局 · 仅 ${b.cities} 城且无将领，一旦失守即败亡`;
+    }
+    if (b.cities <= 1) {
+        return `险局 · 仅 ${b.cities} 城，失守即败亡，请先整军`;
+    }
+    if (b.generals === 0) {
+        return '险局 · 无君主无武将，攻守都缺人（只能靠招募）';
+    }
+    if (b.generals <= 2) {
+        return `艰难 · 将领仅 ${b.generals} 人，尽早招降俘虏`;
+    }
+    if (b.neighbors.length >= 4) {
+        return `四面受敌 · 接壤 ${b.neighbors.length} 家，注意分兵回防`;
+    }
+    return '开局较稳 · 点地图上别的城可改选';
 }
 
 /** 浮层正文：三行，分别回答「多大 / 谁当家和君威 / 挨着谁」 */

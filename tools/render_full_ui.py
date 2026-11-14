@@ -454,4 +454,69 @@ draw_text_at(0, -364, '返回剧本', font_mid, (240, 225, 190, 255))
 ach_out = os.path.join(ROOT, 'tools', 'ui-achieve-preview.png')
 ach_img.save(ach_out)
 print(f'输出 {ach_out}  {ach_img.size}')
+
+# ---------- 地图选势力预览 ----------
+# 放开白名单后：任意有主的城都能点，点选后高亮该势力全境，
+# 浮层第 4 行写开局风险。单独出一张检查 4 行正文与按钮不挤出面板。
+pick_img = img.copy()
+d = ImageDraw.Draw(pick_img, 'RGBA')
+
+# 提示条 / 身份牌切到「尚未执掌」的选势力态
+hb = widget_box(520, 30, left=24, bottom=316)
+draw_rect(hb, (28, 24, 18, 235))
+draw_text_at(hb[0] + 4, (hb[1] + hb[3]) / 2,
+             '点地图上任意一座有主的城选势力 · 所有有城势力皆可执掌',
+             font_log, (255, 235, 180, 255), 'lm')
+fb = widget_box(300, 44, left=16, top=104)
+draw_rect(fb, (28, 24, 18, 235), (210, 178, 108, 230))
+draw_text_at(fb[0] + 44, (fb[1] + fb[3]) / 2, '选势力 · 尚未执掌', font_small,
+             (240, 225, 190, 255), 'lm')
+
+# 金环靶环：细环示意「别家也能点」，粗亮环是「已点选张鲁的全境」。
+# 张鲁在 194 剧本只有汉中一城，正好在当前视野内，也能演示险局提示。
+hint_ids = {'xuchang', 'xiapi', 'ye', 'changan'}
+for p in provs:
+    fid = owners.get(p['id'])
+    if not fid:
+        continue
+    selected = fid == 'zhanglu'
+    if not selected and p['id'] not in hint_ids:
+        continue
+    s = m2s(*project(p['lat'], p['lon']))
+    cx, cy = px(s[0]), py(s[1])
+    r = (21 if p['city'] else 17) * fit + 8
+    d.ellipse([cx - r, cy - r, cx + r, cy + r],
+              outline=(255, 215, 110, 255) if selected else (255, 215, 110, 110),
+              width=4 if selected else 2)
+    if selected:
+        d.ellipse([cx - r - 7, cy - r - 7, cx + r + 7, cy + r + 7],
+                  outline=(255, 215, 110, 130), width=2)
+
+# 底部浮层 720x300，与 GameController 的 FactionPick 一致
+fp = widget_box(720, 300, hcenter=0, bottom=0)
+draw_rect(fp, (28, 24, 18, 248), (190, 160, 100, 220), 2)
+draw_text_at(fp[0] + 18, fp[3] - 26, '执掌 张鲁 · 群雄割据', font_big,
+             (200, 215, 225, 255), 'lm')
+pick_body = [
+    '1 城 · 2 将',
+    '君主 张鲁 · 粮+20%',
+    '接壤 李傕、马腾、张绣',
+    '险局 · 仅 1 城，失守即败亡，请先整军',
+]
+for i, line in enumerate(pick_body):
+    color = (255, 170, 120, 255) if i == 3 else (235, 230, 215, 255)
+    draw_text_at(fp[0] + 18, fp[3] - 62 - i * 27, line, font_row, color, 'lm')
+
+cb = (fp[0] + 20, fp[1] + 18, fp[0] + 20 + 320, fp[1] + 18 + 56)
+draw_rect(cb, (150, 60, 45, 255), (230, 190, 110, 255), 3)
+draw_text_at((cb[0] + cb[2]) / 2, (cb[1] + cb[3]) / 2, '以 张鲁 开局',
+             font_mid, (255, 240, 210, 255))
+bb = (fp[2] - 20 - 160, fp[1] + 18, fp[2] - 20, fp[1] + 18 + 56)
+draw_rect(bb, (70, 58, 42, 255), (190, 160, 100, 220))
+draw_text_at((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2, '返回剧本',
+             font_mid, (240, 225, 190, 255))
+
+pick_out = os.path.join(ROOT, 'tools', 'ui-faction-pick-preview.png')
+pick_img.save(pick_out)
+print(f'输出 {pick_out}  {pick_img.size}')
 print(f'地图 {MAP_W:.0f}x{MAP_H:.0f}，初始缩放 {fit:.3f}')

@@ -233,7 +233,8 @@ export class GameState {
      * 重置为某个剧本的初始局面（= 新开一局）
      *
      * @param scenarioId 剧本 id；省略则沿用当前剧本
-     * @param factionId 玩家想执掌的势力；必须在剧本的可选列表里
+     * @param factionId 玩家想执掌的势力；只要在剧本开局版图里有城即可
+     *                  （不在列表里才回退到默认势力，防止读档脏值判负）
      */
     public reset(scenarioId: string = this.scenarioId, factionId?: string): void {
         const sc = getScenario(scenarioId);

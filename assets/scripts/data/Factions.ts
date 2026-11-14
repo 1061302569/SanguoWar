@@ -2,7 +2,9 @@ import { FactionDef } from './Types';
 
 /**
  * 势力表（194 年群雄割据）
- * playable 标记的势力可被玩家选择。
+ *
+ * 所有在剧本开局版图里有城的势力都可以执掌，`playable` 只是历史遗留的
+ * 「推荐起始势力」标记，不再是白名单；见 Scenarios.selectableFactions()。
  */
 export const FACTIONS: FactionDef[] = [
     {

@@ -11,7 +11,9 @@
  *   3) 预览不能给任何城画玩家金环（玩家还没执掌势力），
  *      但也不能因此放宽「所有底图重绘都带 playerFaction」那条守卫；
  *   4) 选势力阶段点城只切换候选势力，不能进入战斗 / 调兵逻辑；
- *   5) 退出要能回到剧本面板，且不清存档、不动当前局面。
+ *   5) 退出要能回到剧本面板，且不清存档、不动当前局面；
+ *   6) 「可执掌」不是 sc.playable 白名单，而是所有在开局版图里有城的势力，
+ *      1 城 0 将的弱势力也必须真的能开局，且浮层要提前说明是险局。
  *
  * 运行：
  *   node tools/bundle-test.mjs tools/sim-faction-pick.ts
@@ -20,10 +22,11 @@
 import { GameState } from '../assets/scripts/core/GameState.ts';
 import { setRandom } from '../assets/scripts/core/Combat.ts';
 import {
-    SCENARIOS, getScenario, playableFactions, factionBriefOf, factionBriefLines,
+    SCENARIOS, getScenario, playableFactions, selectableFactions,
+    recommendedFactions, factionBriefOf, factionBriefLines, factionRiskLine,
 } from '../assets/scripts/data/Scenarios.ts';
 import { PROVINCES } from '../assets/scripts/data/Provinces.ts';
-import { FACTION_MAP, NEUTRAL } from '../assets/scripts/data/Factions.ts';
+import { FACTIONS, FACTION_MAP, NEUTRAL } from '../assets/scripts/data/Factions.ts';
 import { RULER_OF } from '../assets/scripts/data/Generals.ts';
 
 let pass = 0;
@@ -167,7 +170,99 @@ for (const sc of SCENARIOS) {
 }
 check(allMapped, '所有剧本 / 势力的城池数与 owners 配置逐一对得上');
 
-section('4. 源码守卫：两步开局流程真的接线');
+section('4. 自由选势力：所有在开局版图里有城的势力都能执掌');
+
+{
+    const gs = fresh();
+    let ownedAllSelectable = true;
+    let noNeutralOrGhost = true;
+    let noEmptyFaction = true;
+    let resetAllOk = true;
+    let weakTurnOk = true;
+    const weakRisks: string[] = [];
+    let defaultRisk = '';
+
+    const declaredOf = (sc: typeof SCENARIOS[number], fid: string): number =>
+        Object.keys(sc.owners).filter((pid) => sc.owners[pid] === fid).length;
+
+    for (const sc of SCENARIOS) {
+        const all = selectableFactions(sc);
+        const rec = recommendedFactions(sc);
+        check(all.join(',') === playableFactions(sc).join(','),
+            `${sc.name}：playableFactions 返回全部可选势力（不再是白名单）`);
+        check(all.length > rec.length,
+            `${sc.name}：可选 ${all.length} 家 > 推荐 ${rec.length} 家（白名单已放开）`);
+        check(rec.length > 0 && rec.length <= 4,
+            `${sc.name}：推荐 ${rec.length} 家放得进面板 4 个快捷按钮`);
+        check(rec.indexOf(sc.playerFaction) >= 0
+            && rec.every((fid) => all.indexOf(fid) >= 0),
+        `${sc.name}：推荐势力含默认势力，且都是可执掌势力`);
+
+        // owners 里每一个「非中立 + 势力表里存在」的归属都必须能选
+        for (const pid of Object.keys(sc.owners)) {
+            const fid = sc.owners[pid];
+            if (fid && fid !== NEUTRAL && FACTION_MAP[fid] && all.indexOf(fid) < 0) {
+                ownedAllSelectable = false;
+            }
+        }
+        if (all.indexOf(NEUTRAL) >= 0 || all.some((fid) => !FACTION_MAP[fid])) {
+            noNeutralOrGhost = false;
+        }
+        // 反方向：不在候选里的势力，一定是在这个剧本没有城
+        for (const f of FACTIONS) {
+            if (all.indexOf(f.id) < 0 && declaredOf(sc, f.id) > 0) {
+                noEmptyFaction = false;
+            }
+        }
+
+        for (const fid of all) {
+            gs.reset(sc.id, fid);
+            const declared = declaredOf(sc, fid);
+            if (gs.playerFaction !== fid
+                || gs.provincesOf(fid).length !== declared
+                || gs.generals.size !== 48
+                || gs.isDefeat()) {
+                resetAllOk = false;
+            }
+            const b = factionBriefOf(sc, fid);
+            if (fid === sc.playerFaction) {
+                defaultRisk = factionRiskLine(b);
+            }
+            if (b.cities <= 1 || b.generals === 0) {
+                weakRisks.push(factionRiskLine(b));
+                // 1 城 / 0 将的势力也必须真的能走完一个回合（AI 会打它，但不能崩）
+                try {
+                    gs.endTurn();
+                    if (gs.provinces.size !== PROVINCES.length
+                        || gs.generals.size !== 48) {
+                        weakTurnOk = false;
+                    }
+                } catch (e) {
+                    weakTurnOk = false;
+                }
+            }
+        }
+    }
+    check(ownedAllSelectable, 'owners 里每个有城的正式势力都能在地图上选到');
+    check(noNeutralOrGhost, '中立与未知势力 id 不会混进候选列表');
+    check(noEmptyFaction, '没被列进候选的势力确实在这个剧本 0 城');
+    check(resetAllOk, '每个可选势力都能真正开局：归属 / 城数 / 48 将守恒 / 未判负');
+    check(weakTurnOk, '1 城或 0 将的弱势力能走完一个回合，不抛异常不丢数据');
+    check(weakRisks.length > 0
+        && weakRisks.every((l) => /险局|艰难|四面受敌/.test(l)),
+    `弱势力浮层都给了风险提示（${weakRisks.length} 处）`);
+    check(defaultRisk.length > 0 && defaultRisk.indexOf('险局') < 0,
+        `默认势力不会被误标成险局（${defaultRisk}）`);
+
+    const fake = {
+        ...SCENARIOS[0],
+        owners: { ...SCENARIOS[0].owners, xuchang: 'ghost_faction' },
+    };
+    check(selectableFactions(fake).indexOf('ghost_faction') < 0,
+        '脏配置里的未知势力 id 被拒绝（不会画出无法执掌的靶环）');
+}
+
+section('5. 源码守卫：两步开局流程 + 自由选势力真的接线');
 
 async function sourceGuards(): Promise<void> {
     const { readFileSync } = await import('node:fs');
@@ -248,8 +343,26 @@ async function sourceGuards(): Promise<void> {
     check(scenarios.indexOf('export function factionBriefLines(') >= 0,
         '浮层文案与数据分离（UI 不自己拼字符串）');
 
+    // 自由选势力：白名单实现必须真的被替换，不能只改 UI 文案
+    check(scenarios.indexOf('export function selectableFactions(') >= 0
+        && scenarios.indexOf('sc.playable.filter') < 0,
+    '可选势力按 owners 推导，旧的 sc.playable.filter 白名单已删除');
+    check(scenarios.indexOf('export function recommendedFactions(') >= 0,
+        '推荐势力单独提供（面板 4 个按钮不会被十几家撑爆）');
+    check(ui.indexOf('const factions = recommendedFactions(sc);') >= 0
+        && ui.indexOf('const all = playableFactions(sc);') >= 0,
+    '剧本面板用推荐池做按钮、用全量池校验选中态');
+    check(ui.indexOf('factionRiskLine(brief)') >= 0,
+        '浮层接上开局风险提示（弱势力不再糊里糊涂开局）');
+    check(ui.indexOf('this.pickPreview') >= 0
+        && ui.indexOf('(sc.owners[q.id] || NEUTRAL) === owner') >= 0,
+    '点选后高亮该势力全境（全势力可选时金环仍有意义）');
+    check(ui.indexOf("this.factionLabel.string = '选势力 · 尚未执掌';") >= 0,
+        '进入选势力时身份牌不再显示上一局的「我方 XX」（退出由 refreshAll 恢复）');
     check(readme.indexOf('地图上') >= 0 && readme.indexOf('选势力') >= 0,
         'README 公开「在图上点城选势力」的开局流程');
+    check(readme.indexOf('所有有城势力') >= 0,
+        'README 写明「所有有城势力都可执掌」');
 }
 
 sourceGuards().then(() => {

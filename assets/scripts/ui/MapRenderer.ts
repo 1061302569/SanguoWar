@@ -110,14 +110,17 @@ function hexToColor(hex: string): Color {
     return c;
 }
 
-/** 调整亮度：f>1 变亮，f<1 变暗 */
+/**
+ * 调整亮度：f>1 变亮，f<1 变暗。
+ *
+ * 先按 0.85 压缩原色，给**近白色势力**留出提亮空间。以前直接乘倍率，
+ * 公孙瓒 #e8e3d3 这类颜色乘 1.25 与 1.45 会双双 clamp 成纯白，
+ * 己方和别家看起来一模一样；放开「所有势力都可选」之后这就成了真问题
+ * （玩家找不到自己的地盘）。压缩后 own/other 始终差一档，且整体仍是浅色。
+ */
 function shade(c: Color, f: number): Color {
-    return new Color(
-        Math.min(255, Math.round(c.r * f)),
-        Math.min(255, Math.round(c.g * f)),
-        Math.min(255, Math.round(c.b * f)),
-        c.a,
-    );
+    const lift = (v: number): number => Math.min(255, Math.round(v * 0.85 * f));
+    return new Color(lift(c.r), lift(c.g), lift(c.b), c.a);
 }
 
 /** 路网当前聚焦状态 */
