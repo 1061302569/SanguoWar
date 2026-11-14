@@ -161,6 +161,7 @@ assets/
    │  ├─ Combat.ts              # 战斗结算（多轮消耗战）
    │  ├─ GameState.ts           # 省份/武将/资金/粮草/回合/内政/AI/胜负/存档序列化
    │  ├─ Profile.ts             # 局外档案 / 本局战绩 / 引导 / 阶段目标 / 成就图鉴 / 每日挑战（纯逻辑）
+   │  ├─ UiMode.ts              # UI 模式准入：选势力阶段哪些动作会改「上一局」（纯逻辑）
    │  ├─ Routes.ts              # 由 borders 构建去重路网 + 前线/补给分类 + 箭头几何（纯逻辑）
    │  └─ SfxSynth.ts            # 音效波形合成（运行时生成，无音频文件）
    ├─ data/
@@ -205,7 +206,7 @@ tools/                          # 本地开发辅助（不参与游戏打包）
 ├─ sim-report.ts                # 战报要闻置顶 + 敌情预警：重要度接线 / 置顶 / 刷新 / 存档 / UI 守卫
 ├─ sim-onboarding.ts            # 首次体验闭环：引导推进 / 阶段目标 / 局外档案 / 本局战绩 / 结算分享
 ├─ sim-achievement.ts           # 次日留存：12 条成就判定 / 每日挑战固定种子 / 今日成绩 / 存档兼容
-├─ sim-faction-pick.ts          # 开局流程：全势力可选 / 简报与风险 / 预览按剧本着色 / 不画金环 / 点击拦截
+├─ sim-faction-pick.ts          # 开局流程：全势力可选 / 模式隔离 / 简报与风险 / 预览按剧本着色 / 点击拦截
 ├─ simulate-wechat-build.mjs    # 模拟构建产物并验证校验插件
 ├─ validate-wechat-build.mjs    # 检查构建配置是否合规
 ├─ validate-scene.mjs           # 场景结构静态校验
@@ -330,12 +331,13 @@ node --experimental-strip-types --no-warnings tools/.bundle.sim-achievement.ts
 #     1 城 0 将弱势力能走完回合 / 浮层风险提示 / 势力简报与 owners 逐一对得上 /
 #     无君主·无邻居兜底 / 局面打乱后简报数字不变 / 归属读 sc.owners 而非 p.owner /
 #     点城拦截在 canAttack 之前 / drawPreview 不画金环且恢复玩家势力 /
-#     「所有底图重绘仍带 playerFaction」守卫未被放宽）
+#     选势力时点「结束回合」不推进上一局、不刷回旧视图 / 13 个动作准入 /
+#     11 个 UI 入口守卫 / HUD 隐藏与恢复 / 「所有底图重绘仍带 playerFaction」守卫未被放宽）
 node tools/bundle-test.mjs tools/sim-faction-pick.ts
 node --experimental-strip-types --no-warnings tools/.bundle.sim-faction-pick.ts
 ```
 
-当前状态（**21 个 TS 脚本全部通过：19 个逐项打印的回归合计 1042 项 ok 断言 0 失败，
+当前状态（**21 个 TS 脚本全部通过：19 个逐项打印的回归合计 1074 项 ok 断言 0 失败，
 另有逻辑测试 102/102 与端到端长测 35/35；4 个 mjs 静态校验全通过、
 引擎 tsc 类型检查 0 错误**）：**逻辑测试 102/102 通过、剧本系统回归全部通过、
 回合刷新回归全部通过、路网回归全部通过（35 城 / 58 路、0 条越城直达，
@@ -361,11 +363,13 @@ AI 行为回归全部通过（**27/27**；面板与 AI 共用胜率曲线、国�
 次日留存回归全部通过（**87/87**；12 条成就逐条判定 / 解锁不重复且不改入参 /
 v1 旧档与脏数据兜底 / 60 天种子无碰撞 / 固定种子序列可复现 / 今日成绩破纪录与跨天重置 /
 daily 存档往返与脏值回退 / UI 与状态层接线）、
-开局流程回归全部通过（**82/82**；所有有城势力皆可执掌 / 逐势力真正开局且 48 将守恒 /
+开局流程回归全部通过（**114/114**；所有有城势力皆可执掌 / 逐势力真正开局且 48 将守恒 /
 1 城 0 将弱势力走完回合不崩 / 浮层风险提示 / 势力简报与 owners 逐一对得上 /
 无君主与无邻居兜底 / 局面打乱后简报数字不变 / 归属读 sc.owners /
 点城拦截在 canAttack 之前 / drawPreview 不画金环且恢复玩家势力 /
-白名单实现已删除 / 底图重绘守卫未被放宽）、
+**选势力时点遍 13 个 HUD 动作、上一局状态一字未动** / 11 个 UI 入口守卫 /
+refreshAll 分叉 / HUD 隐藏与恢复幂等 / 白名单实现已删除 /
+底图重绘守卫未被放宽）、
 地图几何自检全部通过、模拟试玩全部通过（点击 / 拖动 / 缩放 / 交互链路）、
 提示系统验证通过、场景校验全部通过、微信构建配置校验全部通过、
 存档往返验证通过、演出一致性验证通过**。
@@ -1630,6 +1634,62 @@ clamp 成纯白，己方和别家长得一模一样。原来只有 4 家可选�
 
 界面预览：`tools/ui-faction-pick-preview.png`（粗金环 = 已选势力的全境，
 细金环 = 其它可点势力；浮层第四行是开局风险）。
+
+## 八·十七、选势力阶段的模式隔离（一次实机 bug）
+
+用户实机发现：进入地图选势力后点「结束回合」，会**直接回到上一局**。这是
+八·十五 做「地图选势力」时留下的洞：只改了交互，没隔离模式。
+
+### 根因
+
+选势力阶段画的是剧本开局版图预览，`GameState` 里还留着上一局。但
+`enterFactionPick()` 只收起了城池面板，HUD 上的按钮一个没禁：
+
+```text
+点「结束回合」→ onEndTurn() 无模式判断 → state.endTurn()
+  → 推进上一局（白走一个回合，AI 照常行动、城池可能易主）
+  → onTurnEnd 回调 → refreshAll()
+  → 按当前局重画版图 / 恢复玩家金环 / showPanel(上一局的城)
+  → selectProvince() 把 mode 改回 'select'
+```
+
+同一个洞还通向别处：顶栏「新局」会用上一局的 `playerFaction` 覆盖刚在地图上
+选好的势力；「俘虏」会把弹窗叠在选势力浮层上；点身份牌定位会选中上一局的城。
+
+### 两层防护
+
+**1. 纯逻辑准入（`core/UiMode.ts`）。** `PICK_BLOCKED` 列出 13 个会改局面、
+或会把视图刷回当前局的动作，`isGameplayAllowed(mode, action)` 是唯一判据。
+`onEndTurn` / `doDomestic` / `doAttack` / `doMove` / `onAttackMode` /
+`onMoveMode` / `onToggleAuto` / `onCancelMode` / `onLocateOwn` /
+`openPrisonMenu` / `selectProvince` 首行统一 `guardFactionPick(action)`，
+拦下时 toast「正在选势力 · 点『返回剧本』回到上一局，或确认后开新局」。
+`openScenarioMenu()` 不拦死而是**改道** `exitFactionPick()`：顶栏「新局」
+等价于返回剧本，且不会覆盖刚选的势力。
+
+**2. 视图隔离。** `refreshAll()` 在 `pickFaction` 分支直接
+`refreshFactionPickView(false)` 并 `return`：只重画开局版图预览、保持浮层、
+提示条与身份牌，绝不往下走。所以即使某个入口漏了守卫，状态层 `onTurnEnd`
+回调也踢不回上一局。预览城池标签只写城名（不露上一局兵力），退出时
+`refreshAll()` 正常分支自动恢复名称 + 兵力。
+
+同时 `hideFactionPickHud()` 把结束回合 / 内政四键 / 进攻 / 调兵 / 自动 /
+俘虏等按钮真的隐藏（记下原状态，`exitFactionPick()` 与 `confirmFactionPick()`
+恢复，且幂等：重复进入不会把「已隐藏」记成原状态、让按钮永久消失）。
+玩家一眼就能看出「这些现在不能点」，而不是点下去才被拒绝。
+
+### 回归怎么测
+
+`tools/sim-faction-pick.ts` 第 5 节：
+
+- **纯逻辑**：13 个动作在 `pickFaction` 全被拒，在 `select / move / attack`
+  全放行（防止误伤正常玩法）；提示文案含「返回剧本」。
+- **状态快照**：把 13 个 HUD 动作挨个点一遍，只要准入放行就执行 `endTurn()`；
+  断言 `GameState` 的回合 / 金币 / 归属 / 兵力 / 俘虏一字未动。
+  对照组在 `select` 下执行同一个动作，局面确实推进 —— 证明断言不是空跑。
+- **源码接线**：11 个入口首行、`refreshAll` 分叉、`onTurnEnd` 回调、
+  HUD 隐藏与恢复、顶栏改道、预览不打开旧面板，共 21 条守卫。
+  纯逻辑写了但没接上，这一层会立刻失败。
 
 ## 九、后续可做（按优先级）
 

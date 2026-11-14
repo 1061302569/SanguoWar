@@ -28,6 +28,9 @@ import {
 import { PROVINCES } from '../assets/scripts/data/Provinces.ts';
 import { FACTIONS, FACTION_MAP, NEUTRAL } from '../assets/scripts/data/Factions.ts';
 import { RULER_OF } from '../assets/scripts/data/Generals.ts';
+import {
+    GameMode, GameplayAction, PICK_BLOCKED, isGameplayAllowed, factionPickHint,
+} from '../assets/scripts/core/UiMode.ts';
 
 let pass = 0;
 let fail = 0;
@@ -262,7 +265,59 @@ section('4. 自由选势力：所有在开局版图里有城的势力都能执�
         '脏配置里的未知势力 id 被拒绝（不会画出无法执掌的靶环）');
 }
 
-section('5. 源码守卫：两步开局流程 + 自由选势力真的接线');
+section('5. 模式隔离：选势力时点「结束回合」不能回到上一局');
+
+{
+    const modes: GameMode[] = ['select', 'move', 'attack', 'pickFaction'];
+    check(PICK_BLOCKED.length >= 12
+        && new Set(PICK_BLOCKED).size === PICK_BLOCKED.length,
+    `准入清单覆盖 ${PICK_BLOCKED.length} 个动作且无重复`);
+    check(PICK_BLOCKED.every((a) => !isGameplayAllowed('pickFaction', a)),
+        'pickFaction 下所有会改局面的动作全被拒绝');
+    check(modes.filter((m) => m !== 'pickFaction')
+        .every((m) => PICK_BLOCKED.every((a) => isGameplayAllowed(m, a))),
+    'select / move / attack 下这些动作照常可用（没有误伤正常玩法）');
+    for (const a of ['endTurn', 'selectProvince', 'refreshAll', 'openScenario'] as GameplayAction[]) {
+        check(!isGameplayAllowed('pickFaction', a), `关键动作 ${a} 在选势力时被拒绝`);
+    }
+    check(factionPickHint().indexOf('返回剧本') >= 0,
+        '被拦下时给出去路（不是只说「不行」）');
+
+    // 真正模拟点击：把 HUD 上所有会改局面的动作挨个点一遍，
+    // 只要准入放行就执行 endTurn()（破坏力最大的那个）。
+    const snapshot = (gs: GameState): string => JSON.stringify({
+        turn: gs.turn,
+        gold: [...gs.gold],
+        auto: gs.autoDomestic,
+        owners: [...gs.provinces.values()].map((p) => p.owner),
+        troops: [...gs.provinces.values()].map((p) => p.troops),
+        prisoners: [...gs.generals.values()].map((g) => g.captiveOf),
+    });
+
+    const gs = fresh();
+    const before = snapshot(gs);
+    let executed = 0;
+    for (const a of PICK_BLOCKED) {
+        if (isGameplayAllowed('pickFaction', a)) {
+            gs.endTurn();
+            executed++;
+        }
+    }
+    check(executed === 0, `选势力下 ${PICK_BLOCKED.length} 个动作一个都没放行`);
+    check(snapshot(gs) === before,
+        '把 HUD 按钮点一遍之后，上一局的回合 / 金币 / 归属 / 兵力 / 俘虏一字未动');
+
+    // 对照组：普通模式同一个动作确实会推进局面，证明上面的断言不是空跑
+    const gs2 = fresh();
+    const before2 = snapshot(gs2);
+    if (isGameplayAllowed('select', 'endTurn')) {
+        gs2.endTurn();
+    }
+    check(snapshot(gs2) !== before2,
+        '对照组：普通模式结束回合确实会推进局面（守卫不是摆设）');
+}
+
+section('6. 源码守卫：两步开局流程 + 自由选势力 + 模式隔离真的接线');
 
 async function sourceGuards(): Promise<void> {
     const { readFileSync } = await import('node:fs');
@@ -363,6 +418,60 @@ async function sourceGuards(): Promise<void> {
         'README 公开「在图上点城选势力」的开局流程');
     check(readme.indexOf('所有有城势力') >= 0,
         'README 写明「所有有城势力都可执掌」');
+
+    // ---- 模式隔离：光有纯逻辑不够，每个 UI 入口都必须真的接上 ----
+    const uiMode = readFileSync('assets/scripts/core/UiMode.ts', 'utf8');
+    check(ui.indexOf("from './core/UiMode'") >= 0
+        && uiMode.indexOf('export function isGameplayAllowed(') >= 0
+        && uiMode.indexOf('export const PICK_BLOCKED') >= 0,
+    '准入判定在纯逻辑层（Node 可直接测），Controller 真的 import 了它');
+    check(ui.indexOf('toast(factionPickHint())') >= 0,
+        '被拦下时给玩家明确去路');
+    const guarded: Array<[string, string]> = [
+        ['private onEndTurn()', 'endTurn'],
+        ['private onToggleAuto()', 'autoDomestic'],
+        ['private doDomestic(', 'domestic'],
+        ['private doAttack(', 'attack'],
+        ['private doMove(', 'move'],
+        ['private onAttackMode()', 'attackMode'],
+        ['private onMoveMode()', 'moveMode'],
+        ['private onCancelMode()', 'cancelMode'],
+        ['private onLocateOwn()', 'locateOwn'],
+        ['private openPrisonMenu()', 'openPrison'],
+        ['private selectProvince(', 'selectProvince'],
+    ];
+    for (const [sig, action] of guarded) {
+        const at = ui.indexOf(sig);
+        check(at >= 0
+            && ui.slice(at, at + 460).indexOf(`guardFactionPick('${action}')`) >= 0,
+        `${sig} 首行拦住 ${action}`);
+    }
+    const ra = ui.indexOf('private refreshAll()');
+    check(ra >= 0
+        && ui.slice(ra, ra + 420).indexOf("isGameplayAllowed(this.mode, 'refreshAll')") >= 0
+        && ui.indexOf('this.refreshFactionPickView(false)') >= 0,
+    'refreshAll 选势力分支只重画预览并 return（onTurnEnd 回调也踢不回上一局）');
+    check(ui.indexOf('this.state.onTurnEnd = () => this.refreshAll();') >= 0,
+        '状态层回合回调仍走 refreshAll（由上面的分叉兜住）');
+    check(ui.indexOf('private refreshFactionPickView(') >= 0
+        && ui.indexOf('this.panel.active = false;') >= 0
+        && ui.indexOf('this.factionPickPanel.active = true;') >= 0,
+    '预览视图不会打开上一局的城池面板');
+    check(ui.indexOf('v.label.string = p.name;') >= 0,
+        '预览城池标签不显示上一局兵力');
+    check(ui.indexOf('this.hideFactionPickHud()') >= 0
+        && ui.indexOf('this.restoreFactionPickHud()') >= 0
+        && ui.indexOf('this.endTurnBtn') >= 0,
+    '结束回合等 HUD 按钮真的被隐藏，并在退出 / 确认时恢复');
+    check(ui.indexOf('if (this.factionPickHidden.length > 0)') >= 0,
+        '隐藏 HUD 幂等：重复进入不会把「已隐藏」记成原状态、导致按钮永久消失');
+    const osm = ui.indexOf('private openScenarioMenu()');
+    check(osm >= 0
+        && ui.slice(osm, osm + 460).indexOf("isGameplayAllowed(this.mode, 'openScenario')") >= 0
+        && ui.slice(osm, osm + 460).indexOf('this.exitFactionPick()') >= 0,
+    '顶栏「新局」在选势力阶段改道返回剧本（不会覆盖刚选的势力）');
+    check(ui.indexOf("if (this.mode === 'pickFaction') {\n            this.factionLabel.string = '选势力 · 尚未执掌';") >= 0,
+        'refreshHud 被直接调用也不会把上一局身份牌刷回来');
 }
 
 sourceGuards().then(() => {

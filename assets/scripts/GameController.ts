@@ -6,6 +6,9 @@ import { GameState, DomesticOrder, POLICY_NAME } from './core/GameState';
 import { Balance } from './core/Balance';
 import { setRandom } from './core/Combat';
 import {
+    GameplayAction, isGameplayAllowed, factionPickHint,
+} from './core/UiMode';
+import {
     PROFILE_KEY, PlayerProfile, RunResult, defaultProfile, sanitizeProfile,
     TUTORIAL_STEPS, OBJECTIVE_IDS, OBJECTIVE_NAMES, objectiveLevel, objectiveLines,
     tutorialLine, gradeOf, shareTextOf, recordResult, profileLine,
@@ -184,6 +187,12 @@ export class GameController extends Component {
     private factionIds: string[] = [];
     /** 选势力阶段的开局版图快照（按 sc.owners 着色，不碰当前局面） */
     private pickPreview: ProvinceState[] = [];
+    /**
+     * 选势力阶段临时隐藏的 HUD 按钮，连同进入前的 active 状态。
+     * 隐藏而不是只靠回调守卫：玩家一眼就能看出「这些现在不能点」；
+     * 退出时逐项恢复，不覆盖 refreshDomesticButtons() 的显隐规则。
+     */
+    private factionPickHidden: Array<{ node: Node; active: boolean }> = [];
     /** 剧本选择弹窗里待确认的选择 */
     private pickScenarioId = DEFAULT_SCENARIO_ID;
     private pickFactionId = 'cao';
@@ -484,6 +493,13 @@ export class GameController extends Component {
 
     /** 打开剧本选择（顶栏「新局」或结算面板「换个剧本」） */
     private openScenarioMenu(): void {
+        if (!isGameplayAllowed(this.mode, 'openScenario')) {
+            // 顶栏「新局」在选势力阶段等价于「返回剧本」。不能直接往下走：
+            // 下面会用上一局的 playerFaction 覆盖刚在地图上选好的势力，
+            // 还会把剧本面板叠在选势力浮层上。exit 会先把 mode 改回 select。
+            this.exitFactionPick();
+            return;
+        }
         this.pickScenarioId = this.state.scenarioId;
         this.pickFactionId = this.state.playerFaction;
         // 直接翻到当前剧本所在页，玩家一眼看到自己在玩哪个
@@ -517,7 +533,7 @@ export class GameController extends Component {
     // 势力的城。面板里的势力按钮保留为「预选」，进来时直接高亮那一家。
     // ==================================================================
 
-    /** 进入地图选势力模式：收起面板，高亮所有可玩势力的城池 */
+    /** 进入地图选势力模式：收起面板，进入「只读预览」状态 */
     private enterFactionPick(): void {
         const sc = getScenario(this.pickScenarioId);
         const playable = playableFactions(sc);
@@ -529,23 +545,75 @@ export class GameController extends Component {
             this.pickFactionId = playable[0];
         }
 
-        this.menuLayer.active = false;
         this.mode = 'pickFaction';
         this.selected = null;
-        this.panel.active = false;
-        this.factionPickPanel.active = true;
-        this.cancelBtn.active = false;
-        // 全图视角：选势力要看的是「谁在哪、谁挨着谁」，停在上一局的
-        // 局部视野里会看不到大部分候选势力。
-        this.mapInput.resetView();
+        // HUD 上会改局面的按钮必须真的藏起来，不能只在回调里 return：
+        // 以前点「结束回合」会连人带地图退回上一局，还把那一局推进了一回合。
+        this.hideFactionPickHud();
+        this.refreshFactionPickView(true);
+        this.audio.play('click');
+    }
 
-        // 地图切到「无主视角」：draw(list, '') 不给任何城画玩家金环。
-        // 否则上一局的金环还亮着，玩家会以为那家已经归自己了。
-        //
+    /** 选势力阶段临时隐藏 HUD 操作按钮，记下原状态供退出恢复 */
+    private hideFactionPickHud(): void {
+        // 幂等：万一重复进入，不能把「已隐藏」的 false 当成原状态记下来，
+        // 否则退出时按钮会永久消失。
+        if (this.factionPickHidden.length > 0) {
+            return;
+        }
+        const nodes = [
+            this.endTurnBtn, this.autoBtn, this.prisonBtn,
+            this.governBtn, this.farmBtn, this.fortifyBtn, this.recruitBtn,
+            this.attackBtn, this.moveBtn, this.cancelBtn,
+        ];
+        for (const n of nodes) {
+            if (!n || !n.isValid) {
+                continue;
+            }
+            this.factionPickHidden.push({ node: n, active: n.active });
+            n.active = false;
+        }
+    }
+
+    /** 退出 / 确认开局时恢复 HUD（顺序上先恢复，再让 refreshAll 重算显隐） */
+    private restoreFactionPickHud(): void {
+        for (const item of this.factionPickHidden) {
+            if (item.node && item.node.isValid) {
+                item.node.active = item.active;
+            }
+        }
+        this.factionPickHidden = [];
+    }
+
+    /** 选势力阶段：任何会改动「上一局」的动作都先拦住，并给出去路 */
+    private guardFactionPick(action: GameplayAction): boolean {
+        if (isGameplayAllowed(this.mode, action)) {
+            return false;
+        }
+        this.toast(factionPickHint());
+        return true;
+    }
+
+    /**
+     * 选势力阶段的**唯一**视图渲染入口。
+     *
+     * 进入时 forceFullView=true 切全图；之后任何 refreshAll()（含状态层
+     * onTurnEnd 回调）都只重画预览，不重置视野、不碰当前局、不刷回城池面板。
+     * 这样即使某个按钮漏了守卫，也不会把玩家踢回上一局。
+     */
+    private refreshFactionPickView(forceFullView: boolean): void {
+        const sc = getScenario(this.pickScenarioId);
+        const playable = playableFactions(sc);
+        // 全图视角：选势力要看「谁在哪、谁挨着谁」。只在进入时做一次，
+        // 后续刷新别把玩家刚聚焦的城又拉回全图。
+        if (forceFullView) {
+            this.mapInput.resetView();
+        }
+
+        // 地图切到「无主视角」：不给任何城画玩家金环。
         // ⚠ 版图必须按**剧本开局配置**重新着色，不能直接用当前 ProvinceState：
-        // 玩家可能在中途打开剧本面板，这时地图还是上一局打乱后的版图，
-        // 照着它画会把「曹操的地盘」染成袁绍色，选势力直接失去意义。
-        // 这里只覆盖 owner，其它字段与原型保持不变（{...p} 会丢 class 方法）。
+        // 玩家可能在中途打开剧本面板，这时地图还是上一局打乱后的版图。
+        // 只覆盖 owner，其它字段与原型保持不变（{...p} 会丢 class 方法）。
         const preview: ProvinceState[] = [];
         this.state.provinces.forEach((p) => {
             const owner = sc.owners[p.id] || NEUTRAL;
@@ -557,20 +625,33 @@ export class GameController extends Component {
         });
         this.mapRenderer.drawPreview(preview);
         this.pickPreview = preview;
-        // 全部势力都可选之后，给「所有有主的城」画金环等于给全图画金环，
-        // 反而看不出重点。进入时只标推荐势力作为起点参考，点选某家之后
-        // 立刻改成高亮那家的全境（见 pickFactionAt）。
-        const recommended = recommendedFactions(sc);
-        const picks = preview.filter((p) => recommended.indexOf(p.owner) >= 0);
+
+        // 进入时只标推荐势力作起点参考；已经点选过就标那一家的全境。
+        const chosen = playable.indexOf(this.pickFactionId) >= 0
+            ? this.pickFactionId : '';
+        const picks = chosen
+            ? preview.filter((p) => p.owner === chosen)
+            : preview.filter((p) => recommendedFactions(sc).indexOf(p.owner) >= 0);
         this.mapRenderer.drawHighlights(picks, 'select');
         this.mapRenderer.setRouteFocus(null, []);
 
+        // 城池标签不能露出上一局的兵力：预览只写城名，退出由 refreshAll 恢复。
+        for (const p of preview) {
+            const v = this.hexLabels.get(p.id);
+            if (v) {
+                v.label.string = p.name;
+                v.label.fontSize = 17;
+                v.label.lineHeight = 18;
+                v.label.color = new Color(30, 24, 16, 255);
+            }
+        }
+
+        this.menuLayer.active = false;
+        this.panel.active = false;
+        this.factionPickPanel.active = true;
         this.hintLabel.string = `点地图上任意一座有主的城选择势力 · 本剧本 ${playable.length} 家皆可执掌`;
-        // 身份牌还写着上一局的「我方 曹操」会让人以为已经执掌了；
-        // 退出时 exitFactionPick() -> refreshAll() 会把它恢复回来。
         this.factionLabel.string = '选势力 · 尚未执掌';
         this.refreshFactionPick();
-        this.audio.play('click');
     }
 
     /** 退出选势力模式，回到剧本面板（不动当前局面，也不清存档） */
@@ -578,6 +659,7 @@ export class GameController extends Component {
         this.mode = 'select';
         this.selected = null;
         this.pickPreview = [];
+        this.restoreFactionPickHud();
         this.factionPickPanel.active = false;
         this.mapRenderer.clearHighlights();
         // refreshAll 会把地图恢复成「当前局的视角」（玩家金环回来）
@@ -652,6 +734,7 @@ export class GameController extends Component {
         }
         this.mode = 'select';
         this.pickPreview = [];
+        this.restoreFactionPickHud();
         this.factionPickPanel.active = false;
         this.mapRenderer.clearHighlights();
         this.audio.play('click');
@@ -912,6 +995,9 @@ export class GameController extends Component {
 
     /** 打开俘虏营：和剧本 / 结算面板互斥，共用同一层遮罩 */
     private openPrisonMenu(): void {
+        if (this.guardFactionPick('openPrison')) {
+            return;
+        }
         this.prisonPage = 0;
         this.menuLayer.active = true;
         this.scenarioPanel.active = false;
@@ -1432,6 +1518,9 @@ export class GameController extends Component {
      * 只居中、不改变缩放，全图路网依旧一眼看全；想回全图点顶栏「全图」。
      */
     private onLocateOwn(): void {
+        if (this.guardFactionPick('locateOwn')) {
+            return;
+        }
         const target = this.pickFrontlineProvince();
         if (!target) {
             this.toast('已无我方城池');
@@ -2091,6 +2180,11 @@ export class GameController extends Component {
     }
 
     private selectProvince(p: ProvinceState | null): void {
+        // 这个方法会把 mode 改回 select 并打开城池面板，是「被踢回上一局」
+        // 的直接原因之一。选势力阶段只允许 pickFactionAt() 直接赋值 selected。
+        if (this.guardFactionPick('selectProvince')) {
+            return;
+        }
         this.selected = p;
         this.mode = 'select';
         this.mapRenderer.clearHighlights();
@@ -2386,6 +2480,9 @@ export class GameController extends Component {
      * 不再单独选方针 —— 你最后点了什么，自动就做什么。想换就点另一个内政按钮。
      */
     private onToggleAuto(): void {
+        if (this.guardFactionPick('autoDomestic')) {
+            return;
+        }
         this.state.autoDomestic = !this.state.autoDomestic;
         this.refreshAutoButton();
         this.refreshDomesticButtons();
@@ -2422,6 +2519,9 @@ export class GameController extends Component {
     }
 
     private doAttack(from: ProvinceState, to: ProvinceState): void {
+        if (this.guardFactionPick('attack')) {
+            return;
+        }
         // 演出进行中不接受新的进攻，避免时序错乱
         if (this.showcase.busy) {
             this.toast('战斗演出进行中，请稍候…');
@@ -2525,6 +2625,9 @@ export class GameController extends Component {
     }
 
     private doMove(from: ProvinceState, to: ProvinceState): void {
+        if (this.guardFactionPick('move')) {
+            return;
+        }
         // 调兵的含义是「把兵送到需要的地方」，所以默认把目标城填满，
         // 出发城只留 100 的最低守备。旧版固定调一半：想把后方兵送到前线，
         // 得点三四次、过两三个中转城，每次只剩一半，纯体力活 —— 而真正的
@@ -2585,6 +2688,9 @@ export class GameController extends Component {
      * 所以方针变化要写进 toast，不能让玩家毫不知情。
      */
     private doDomestic(order: DomesticOrder): void {
+        if (this.guardFactionPick('domestic')) {
+            return;
+        }
         const p = this.selected;
         if (!p || p.owner !== this.state.playerFaction) {
             return;
@@ -2616,6 +2722,9 @@ export class GameController extends Component {
 
     /** 进入进攻模式：高亮敌方邻省 */
     private onAttackMode(): void {
+        if (this.guardFactionPick('attackMode')) {
+            return;
+        }
         const p = this.selected;
         if (!p || p.owner !== this.state.playerFaction) {
             return;
@@ -2642,6 +2751,9 @@ export class GameController extends Component {
 
     /** 进入调兵模式：高亮己方邻省 */
     private onMoveMode(): void {
+        if (this.guardFactionPick('moveMode')) {
+            return;
+        }
         const p = this.selected;
         if (!p || p.owner !== this.state.playerFaction) {
             return;
@@ -2661,6 +2773,9 @@ export class GameController extends Component {
 
     /** 取消当前模式 */
     private onCancelMode(): void {
+        if (this.guardFactionPick('cancelMode')) {
+            return;
+        }
         this.mode = 'select';
         this.mapRenderer.clearHighlights();
         this.cancelBtn.active = false;
@@ -2669,6 +2784,11 @@ export class GameController extends Component {
     }
 
     private onEndTurn(): void {
+        // 选势力阶段绝不能结束回合：GameState 里还是上一局，
+        // endTurn() 会推进它并触发 onTurnEnd -> refreshAll() 把视图刷回去。
+        if (this.guardFactionPick('endTurn')) {
+            return;
+        }
         // 演出进行中不允许结束回合，避免状态交错
         if (this.showcase.busy) {
             return;
@@ -2860,6 +2980,13 @@ export class GameController extends Component {
     // ==================================================================
 
     private refreshAll(): void {
+        // 选势力阶段：状态层 onTurnEnd / 存档回调 / 任何误触的刷新都只能重画
+        // 开局版图预览。绝不能往下走 —— 下面会按当前局重画版图、刷新身份牌、
+        // 甚至 showPanel(上一局的城)，玩家会被直接踢回上一局。
+        if (!isGameplayAllowed(this.mode, 'refreshAll')) {
+            this.refreshFactionPickView(false);
+            return;
+        }
         // 重新绘制地图
         const list: ProvinceState[] = [];
         this.state.provinces.forEach((p) => list.push(p));
@@ -2910,6 +3037,10 @@ export class GameController extends Component {
         // 否则玩家会拿着上一局的势力色去找自己的地盘。
         const f = FACTION_MAP[st.playerFaction];
         this.factionLabel.string = `我方 ${f ? f.name : st.playerFaction} · ${mine} 城`;
+        // 万一有别的路径直接调 refreshHud()，也不能把上一局的身份牌刷回来
+        if (this.mode === 'pickFaction') {
+            this.factionLabel.string = '选势力 · 尚未执掌';
+        }
         const own = new Color();
         Color.fromHEX(own, f ? f.color : '#b8b2a4');
         const sg = this.factionSwatch;
